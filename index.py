@@ -6,6 +6,7 @@ import logging
 import re
 import random
 import json
+from urllib.parse import urlparse, parse_qs
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Optional, Dict, Any
@@ -23,7 +24,7 @@ import asyncpg
 BOT_TOKEN = os.getenv("TERMINATOR_BOT_TOKEN")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 OWNER_ID = int(os.getenv("TERMINATOR_OWNER_ID", "0"))
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()  # Strip whitespace
 
 # Configuration
 RISK_DECAY_MINUTES = 60
@@ -32,7 +33,7 @@ STRIKE_THRESHOLD_MUTE = 15
 STRIKE_THRESHOLD_BAN = 25
 RAID_JOIN_THRESHOLD = 8
 RAID_TIME_WINDOW = 60
-AUTONOMOUS_CHECK_INTERVAL = 600  # 10 minutes
+AUTONOMOUS_CHECK_INTERVAL = 600
 
 # Logging Setup
 logging.basicConfig(
@@ -42,28 +43,57 @@ logging.basicConfig(
 logger = logging.getLogger("TerminatorCore")
 
 # ==============================================================================
-# 🗄 DATABASE CORE (SUPABASE DIRECT POSTGRESQL)
+# 🗄 DATABASE CORE (SUPABASE - ROBUST CONNECTION)
 # ==============================================================================
 
 class DatabaseCore:
     def __init__(self, db_url: str):
-        self.db_url = db_url
+        self.raw_url = db_url
+        self.parsed = None
         self.pool = None
         self.personality = {}
+        self._parse_url()
+
+    def _parse_url(self):
+        """Parse Supabase URL safely"""
+        try:
+            # Remove any query params for parsing, we'll add SSL separately
+            base_url = self.raw_url.split('?')[0].strip()
+            self.parsed = urlparse(base_url)
+            
+            logger.info(f"🔍 Parsed DB URL: {self.parsed.scheme}://{self.parsed.username}@{self.parsed.hostname}:{self.parsed.port}/{self.parsed.path}")
+            
+            if not all([self.parsed.hostname, self.parsed.port, self.parsed.path]):
+                raise ValueError("URL missing required components")
+                
+        except Exception as e:
+            logger.error(f"❌ Failed to parse SUPABASE_DB_URL: {e}")
+            raise
 
     async def init(self):
         try:
             logger.info(f"🔗 Connecting to Supabase PostgreSQL...")
             
-            if not self.db_url or "postgresql://" not in self.db_url:
-                raise ValueError("Invalid SUPABASE_DB_URL format")
+            if not self.raw_url or not self.parsed:
+                raise ValueError("Invalid or empty SUPABASE_DB_URL")
+            
+            # Build connection params explicitly (more reliable than URL string)
+            connection_params = {
+                "host": self.parsed.hostname,
+                "port": self.parsed.port,
+                "user": self.parsed.username,
+                "password": self.parsed.password,
+                "database": self.parsed.path.lstrip('/'),
+                "ssl": True,  # Explicit SSL for Supabase
+                "timeout": 30,
+            }
+            
+            logger.info(f"🔐 Connecting with SSL: {self.parsed.hostname}:{self.parsed.port}")
             
             self.pool = await asyncpg.create_pool(
-                self.db_url,
+                **connection_params,
                 min_size=2,
                 max_size=10,
-                ssl=True,
-                timeout=30
             )
             
             # Test connection
@@ -75,10 +105,18 @@ class DatabaseCore:
             logger.info("✅ DATABASE CORE: Connected. Full autonomy enabled.")
             
         except asyncpg.InvalidPasswordError:
-            logger.error("❌ DATABASE ERROR: Invalid password in SUPABASE_DB_URL")
+            logger.error("❌ DATABASE ERROR: Invalid password - check your Supabase service role password")
             sys.exit(1)
         except asyncpg.InvalidCatalogNameError:
-            logger.error("❌ DATABASE ERROR: Database not found")
+            logger.error("❌ DATABASE ERROR: Database 'postgres' not found - check your Supabase project")
+            sys.exit(1)
+        except asyncpg.PostgresConnectionError as e:
+            logger.error(f"❌ DATABASE CONNECTION ERROR: {e}")
+            logger.error("💡 Tips: 1) Use port 5432, 2) Check password, 3) Ensure SSL is enabled in Supabase")
+            sys.exit(1)
+        except ValueError as e:
+            logger.error(f"❌ URL PARSING ERROR: {e}")
+            logger.error("💡 Ensure SUPABASE_DB_URL format: postgresql://user:pass@host:port/dbname")
             sys.exit(1)
         except Exception as e:
             logger.error(f"❌ DATABASE CONNECTION FAILED: {type(e).__name__}: {e}")
@@ -154,7 +192,6 @@ class DatabaseCore:
     # ========== AUTONOMOUS SELF-MANAGEMENT ==========
 
     async def create_table(self, table_name: str, columns: Dict[str, str]):
-        """Create a new table dynamically"""
         protected = ['users', 'groups', 'bot_personality', 'bot_logs']
         if table_name in protected:
             return False, "Cannot create core system tables (already exist)"
@@ -171,7 +208,6 @@ class DatabaseCore:
             return False, str(e)
 
     async def delete_table(self, table_name: str):
-        """Delete a table (protects core tables)"""
         protected = ['users', 'groups', 'bot_personality', 'bot_logs']
         if table_name in protected:
             return False, "Cannot delete core system tables"
@@ -184,7 +220,6 @@ class DatabaseCore:
             return False, str(e)
 
     async def update_personality(self, new_config: Dict[str, Any]):
-        """Update bot personality from AI analysis"""
         set_clauses = []
         values = []
         for key, value in new_config.items():
@@ -253,7 +288,6 @@ class DatabaseCore:
     # ========== AUTO-CLEANUP FOR USER WARNINGS ==========
 
     async def cleanup_user_risk_scores(self):
-        """Automatically reduce risk scores for users behaving well"""
         try:
             logger.info("🧹 Running auto-cleanup for user risk scores...")
             
@@ -273,10 +307,8 @@ class DatabaseCore:
                     if last_offense:
                         try:
                             time_since = datetime.now() - last_offense.replace(tzinfo=None)
-                            
                             if time_since > timedelta(minutes=RISK_DECAY_MINUTES * 2):
                                 new_score = max(0, current_score - 5)
-                                
                                 if new_score != current_score:
                                     await conn.execute(
                                         "UPDATE users SET risk_score = $1, last_good_behavior = $2 WHERE user_id = $3",
@@ -411,35 +443,24 @@ ai_core = AIAutonomousCore(GEMINI_API_KEY)
 # ==============================================================================
 
 async def autonomous_loop(app: Application):
-    """Main autonomous loop: self-evolution + auto-cleanup"""
     while True:
         try:
             await asyncio.sleep(AUTONOMOUS_CHECK_INTERVAL)
             logger.info("🔄 AUTONOMOUS LOOP: Running self-analysis...")
             
-            # 1. Self-evolution
             logs = await db.get_recent_logs(50)
             personality = await db.get_personality()
             evolution_plan = await ai_core.self_evolve(logs, personality)
             
             if evolution_plan:
-                # Execute Personality Update
                 if evolution_plan.get('evolve_personality'):
                     await db.update_personality(evolution_plan['evolve_personality'])
-                    logger.info(f"🧠 Personality evolved - {evolution_plan.get('reason')}")
-                
-                # Execute Table Creation
                 if evolution_plan.get('create_table'):
                     tbl = evolution_plan['create_table']
                     await db.create_table(tbl['name'], tbl['columns'])
-                    logger.info(f"🔧 Table created - {tbl['name']}")
-                
-                # Execute Table Deletion
                 if evolution_plan.get('delete_table'):
-                    success, msg = await db.delete_table(evolution_plan['delete_table'])
-                    logger.info(f"🔧 Table deleted - {msg}")
+                    await db.delete_table(evolution_plan['delete_table'])
             
-            # 2. Auto-cleanup user warnings
             await db.cleanup_user_risk_scores()
             
         except Exception as e:
@@ -531,7 +552,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if group_data and group_data.get('raid_mode'):
         lockdown = group_data.get('lockdown_until')
         if lockdown:
-            lock_dt = lockdown.replace(tzinfo=None) if hasattr(lockdown, 'replace') else datetime.fromisoformat(lockdown)
+            lock_dt = lockdown.replace(tzinfo=None) if hasattr(lockdown, 'replace') else datetime.fromisoformat(str(lockdown))
             if datetime.now() < lock_dt:
                 perm_status = await permission_mgr.get_status(context, chat_id)
                 if perm_status['can_delete']:
@@ -585,7 +606,6 @@ async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await context.bot.send_message(chat_id, "🚨 RAID DETECTED. LOCKDOWN INITIATED.")
 
 async def cmd_killswitch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """ONLY COMMAND FOR HUMANS - Emergency Stop"""
     if update.effective_user.id != OWNER_ID: return
     await update.message.reply_text("🛑 KILL SWITCH ACTIVATED. SHUTTING DOWN.")
     logger.critical("🛑 KILL SWITCH TRIGGERED BY OWNER")
@@ -624,7 +644,6 @@ def main():
     logger.info("🧠 AUTONOMOUS EVOLUTION: ACTIVE")
     logger.info("🗄 SELF-MANAGING DATABASE: ACTIVE")
     logger.info("🧹 AUTO-CLEANUP WARNINGS: ACTIVE")
-    logger.info("🔒 HUMAN INTERFERENCE: MINIMAL (Kill Switch Only)")
     
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
