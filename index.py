@@ -32,16 +32,17 @@ STRIKE_THRESHOLD_MUTE = 15
 STRIKE_THRESHOLD_BAN = 25
 RAID_JOIN_THRESHOLD = 8
 RAID_TIME_WINDOW = 60
-AUTONOMOUS_CHECK_INTERVAL = 300  # 5 minutes (Bot checks itself every 5 mins)
+AUTONOMOUS_CHECK_INTERVAL = 600  # 10 minutes
 
+# Logging Setup
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.WARNING
+    level=logging.INFO
 )
 logger = logging.getLogger("TerminatorCore")
 
 # ==============================================================================
-# 🗄 DATABASE CORE (SUPABASE/POSTGRES) - SELF-MANAGING
+# 🗄 DATABASE CORE (SUPABASE DIRECT POSTGRESQL)
 # ==============================================================================
 
 class DatabaseCore:
@@ -52,17 +53,35 @@ class DatabaseCore:
 
     async def init(self):
         try:
+            logger.info(f"🔗 Connecting to Supabase PostgreSQL...")
+            
+            if not self.db_url or "postgresql://" not in self.db_url:
+                raise ValueError("Invalid SUPABASE_DB_URL format")
+            
             self.pool = await asyncpg.create_pool(
                 self.db_url,
                 min_size=2,
                 max_size=10,
-                ssl=True
+                ssl=True,
+                timeout=30
             )
+            
+            # Test connection
+            async with self.pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            
             await self._create_core_tables()
             await self._sync_personality()
-            logger.info("DATABASE CORE: Connected to Supabase. Autonomous mode active.")
+            logger.info("✅ DATABASE CORE: Connected. Full autonomy enabled.")
+            
+        except asyncpg.InvalidPasswordError:
+            logger.error("❌ DATABASE ERROR: Invalid password in SUPABASE_DB_URL")
+            sys.exit(1)
+        except asyncpg.InvalidCatalogNameError:
+            logger.error("❌ DATABASE ERROR: Database not found")
+            sys.exit(1)
         except Exception as e:
-            logger.error(f"DATABASE CONNECTION FAILED: {e}")
+            logger.error(f"❌ DATABASE CONNECTION FAILED: {type(e).__name__}: {e}")
             sys.exit(1)
 
     async def _create_core_tables(self):
@@ -74,6 +93,7 @@ class DatabaseCore:
                     risk_score INTEGER DEFAULT 0,
                     status TEXT DEFAULT 'active',
                     last_offense TIMESTAMP,
+                    last_good_behavior TIMESTAMP,
                     joined_at TIMESTAMP DEFAULT NOW()
                 )
             """)
@@ -109,6 +129,7 @@ class DatabaseCore:
                 VALUES (1, 'cold', 5, 'military')
                 ON CONFLICT (id) DO NOTHING
             """)
+            logger.info("✅ Core tables verified/created")
 
     async def _sync_personality(self):
         async with self.pool.acquire() as conn:
@@ -126,33 +147,44 @@ class DatabaseCore:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow(query, *args)
 
+    async def fetchall(self, query: str, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(query, *args)
+
     # ========== AUTONOMOUS SELF-MANAGEMENT ==========
 
     async def create_table(self, table_name: str, columns: Dict[str, str]):
+        """Create a new table dynamically"""
+        protected = ['users', 'groups', 'bot_personality', 'bot_logs']
+        if table_name in protected:
+            return False, "Cannot create core system tables (already exist)"
+        
         col_defs = ", ".join([f"{name} {dtype}" for name, dtype in columns.items()])
         query = f"CREATE TABLE IF NOT EXISTS {table_name} ({col_defs})"
         try:
             await self.execute(query)
             await self.log_event("table_created", {"table": table_name, "columns": columns})
-            logger.info(f"AUTONOMOUS: Created table '{table_name}'")
-            return True
+            logger.info(f"🔧 AUTONOMOUS: Created table '{table_name}'")
+            return True, "Table created"
         except Exception as e:
             logger.error(f"Failed to create table {table_name}: {e}")
-            return False
+            return False, str(e)
 
     async def delete_table(self, table_name: str):
+        """Delete a table (protects core tables)"""
         protected = ['users', 'groups', 'bot_personality', 'bot_logs']
         if table_name in protected:
             return False, "Cannot delete core system tables"
         try:
             await self.execute(f"DROP TABLE IF EXISTS {table_name}")
             await self.log_event("table_deleted", {"table": table_name})
-            logger.info(f"AUTONOMOUS: Deleted table '{table_name}'")
+            logger.info(f"🔧 AUTONOMOUS: Deleted table '{table_name}'")
             return True, "Table deleted"
         except Exception as e:
             return False, str(e)
 
     async def update_personality(self, new_config: Dict[str, Any]):
+        """Update bot personality from AI analysis"""
         set_clauses = []
         values = []
         for key, value in new_config.items():
@@ -168,7 +200,7 @@ class DatabaseCore:
         await self.execute(query, *values)
         await self._sync_personality()
         await self.log_event("personality_updated", new_config)
-        logger.info(f"AUTONOMOUS: Personality updated to {new_config}")
+        logger.info(f"🧠 AUTONOMOUS: Personality updated")
 
     async def log_event(self, event_type: str, details: Dict):
         try:
@@ -180,9 +212,91 @@ class DatabaseCore:
         return self.personality
 
     async def get_recent_logs(self, limit=50):
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("SELECT event_type, details, created_at FROM bot_logs ORDER BY created_at DESC LIMIT $1", limit)
-            return [dict(r) for r in rows]
+        try:
+            async with self.pool.acquire() as conn:
+                rows = await conn.fetch("SELECT event_type, details, created_at FROM bot_logs ORDER BY created_at DESC LIMIT $1", limit)
+                return [dict(r) for r in rows]
+        except:
+            return []
+
+    # ========== USER MANAGEMENT ==========
+
+    async def get_user(self, user_id: int):
+        return await self.fetchone("SELECT * FROM users WHERE user_id = $1", user_id)
+
+    async def upsert_user(self, user_id: int, username: str = "unknown", **kwargs):
+        await self.execute(
+            "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
+            user_id, username
+        )
+        if kwargs:
+            await self.update_user(user_id, **kwargs)
+
+    async def update_user(self, user_id: int, **kwargs):
+        set_clauses = ", ".join([f"{k} = ${i+1}" for i, k in enumerate(kwargs.keys())])
+        values = list(kwargs.values()) + [user_id]
+        await self.execute(f"UPDATE users SET {set_clauses} WHERE user_id = ${len(values)}", *values)
+
+    # ========== GROUP MANAGEMENT ==========
+
+    async def get_group(self, group_id: int):
+        return await self.fetchone("SELECT * FROM groups WHERE group_id = $1", group_id)
+
+    async def upsert_group(self, group_id: int, **kwargs):
+        set_clauses = ", ".join([f"{k} = ${i+2}" for i, k in enumerate(kwargs.keys())])
+        values = [group_id] + list(kwargs.values())
+        await self.execute(
+            f"INSERT INTO groups (group_id) VALUES ($1) ON CONFLICT (group_id) DO UPDATE SET {set_clauses}",
+            *values
+        )
+
+    # ========== AUTO-CLEANUP FOR USER WARNINGS ==========
+
+    async def cleanup_user_risk_scores(self):
+        """Automatically reduce risk scores for users behaving well"""
+        try:
+            logger.info("🧹 Running auto-cleanup for user risk scores...")
+            
+            async with self.pool.acquire() as conn:
+                users = await conn.fetch("""
+                    SELECT user_id, username, risk_score, last_offense, last_good_behavior
+                    FROM users 
+                    WHERE risk_score > 0 AND status = 'active'
+                """)
+                
+                cleaned_count = 0
+                for user in users:
+                    user_id = user['user_id']
+                    current_score = user['risk_score']
+                    last_offense = user['last_offense']
+                    
+                    if last_offense:
+                        try:
+                            time_since = datetime.now() - last_offense.replace(tzinfo=None)
+                            
+                            if time_since > timedelta(minutes=RISK_DECAY_MINUTES * 2):
+                                new_score = max(0, current_score - 5)
+                                
+                                if new_score != current_score:
+                                    await conn.execute(
+                                        "UPDATE users SET risk_score = $1, last_good_behavior = $2 WHERE user_id = $3",
+                                        new_score, datetime.now(), user_id
+                                    )
+                                    cleaned_count += 1
+                                    logger.info(f"🧹 Cleaned user {user_id}: {current_score} → {new_score}")
+                        except:
+                            pass
+                
+                logger.info(f"✅ Auto-cleanup complete: {cleaned_count} users updated")
+                    
+        except Exception as e:
+            logger.error(f"❌ Auto-cleanup error: {e}")
+
+    async def record_good_behavior(self, user_id: int):
+        try:
+            await self.update_user(user_id, last_good_behavior=datetime.now())
+        except:
+            pass
 
 db = DatabaseCore(SUPABASE_DB_URL)
 
@@ -215,6 +329,7 @@ class PermissionManager:
             self.cache[chat_id] = data
             return data
         except Exception as e:
+            logger.error(f"Permission Check Failed: {e}")
             return {'status': 'caged', 'is_admin': False, 'can_restrict': False, 'can_delete': False, 'timestamp': now}
 
     def get_attitude_message(self) -> str:
@@ -239,11 +354,14 @@ class AIAutonomousCore:
             genai.configure(api_key=api_key)
             self.model = genai.GenerativeModel('gemini-pro')
             self.active = True
+            logger.info("✅ AI Core: Gemini initialized")
         else:
             self.active = False
+            logger.warning("⚠️ AI Core: GEMINI_API_KEY not found - running in rule-only mode")
 
     async def analyze_threat(self, text: str, personality: Dict) -> Dict[str, Any]:
-        if not self.active: return {"action": "ignore", "reason": "ai_offline"}
+        if not self.active: 
+            return {"action": "ignore", "reason": "ai_offline"}
         try:
             instruction = f"""
             You are TERMINATOR, a security AI with {personality.get('tone', 'cold')} personality.
@@ -259,7 +377,6 @@ class AIAutonomousCore:
             return {"action": "ignore", "reason": "ai_error"}
 
     async def self_evolve(self, logs: list, current_personality: Dict) -> Dict[str, Any]:
-        """Decides if the bot needs to change its own structure or personality"""
         if not self.active: return {}
         try:
             instruction = """
@@ -290,42 +407,44 @@ class AIAutonomousCore:
 ai_core = AIAutonomousCore(GEMINI_API_KEY)
 
 # ==============================================================================
-# 🔄 AUTONOMOUS BACKGROUND LOOP
+# 🔄 AUTONOMOUS BACKGROUND LOOPS
 # ==============================================================================
 
 async def autonomous_loop(app: Application):
-    """Runs every 5 minutes to self-analyze and evolve"""
+    """Main autonomous loop: self-evolution + auto-cleanup"""
     while True:
         try:
             await asyncio.sleep(AUTONOMOUS_CHECK_INTERVAL)
-            logger.info("AUTONOMOUS LOOP: Running self-analysis...")
+            logger.info("🔄 AUTONOMOUS LOOP: Running self-analysis...")
             
-            # Get recent logs and personality
+            # 1. Self-evolution
             logs = await db.get_recent_logs(50)
             personality = await db.get_personality()
-            
-            # Ask AI if changes are needed
             evolution_plan = await ai_core.self_evolve(logs, personality)
             
             if evolution_plan:
                 # Execute Personality Update
                 if evolution_plan.get('evolve_personality'):
                     await db.update_personality(evolution_plan['evolve_personality'])
-                    logger.info(f"AUTONOMOUS: Personality evolved - {evolution_plan.get('reason')}")
+                    logger.info(f"🧠 Personality evolved - {evolution_plan.get('reason')}")
                 
                 # Execute Table Creation
                 if evolution_plan.get('create_table'):
                     tbl = evolution_plan['create_table']
                     await db.create_table(tbl['name'], tbl['columns'])
-                    logger.info(f"AUTONOMOUS: Table created - {tbl['name']}")
+                    logger.info(f"🔧 Table created - {tbl['name']}")
                 
                 # Execute Table Deletion
                 if evolution_plan.get('delete_table'):
                     success, msg = await db.delete_table(evolution_plan['delete_table'])
-                    logger.info(f"AUTONOMOUS: Table deleted - {msg}")
-                    
+                    logger.info(f"🔧 Table deleted - {msg}")
+            
+            # 2. Auto-cleanup user warnings
+            await db.cleanup_user_risk_scores()
+            
         except Exception as e:
-            logger.error(f"AUTONOMOUS LOOP ERROR: {e}")
+            logger.error(f"❌ AUTONOMOUS LOOP ERROR: {e}")
+            await asyncio.sleep(60)
 
 # ==============================================================================
 # ⚔ STRIKE & STATE MANAGEMENT
@@ -335,26 +454,25 @@ message_flood_cache = defaultdict(list)
 join_cache = defaultdict(list)
 
 async def update_risk_score(user_id: int, increment: int):
-    await db.execute(
-        "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING", 
-        user_id, "unknown"
-    )
-    row = await db.fetchone("SELECT risk_score, status, last_offense FROM users WHERE user_id = $1", user_id)
-    if not row: return None, 0
+    await db.upsert_user(user_id, "unknown")
+    user = await db.get_user(user_id)
+    
+    if not user: return None, 0
+    if user.get("status") == "banned": return None, user.get("risk_score", 0)
 
-    current_score = row['risk_score']
-    status = row['status']
-    last_offense = row['last_offense']
-    if status == 'banned': return None, current_score
-
+    current_score = user.get("risk_score", 0)
+    last_offense = user.get("last_offense")
     new_score = current_score + increment
+    
     if last_offense:
         try:
-            if datetime.now() - last_offense.replace(tzinfo=None) > timedelta(minutes=RISK_DECAY_MINUTES):
-                new_score = max(0, new_score - 5)
+            time_diff = datetime.now() - last_offense.replace(tzinfo=None)
+            if time_diff > timedelta(minutes=RISK_DECAY_MINUTES):
+                decay = min(5, int(time_diff.total_seconds() / 3600))
+                new_score = max(0, new_score - decay)
         except: pass
 
-    await db.execute("UPDATE users SET risk_score = $1, last_offense = $2 WHERE user_id = $3", new_score, datetime.now(), user_id)
+    await db.update_user(user_id, risk_score=new_score, last_offense=datetime.now())
 
     action_taken = None
     if new_score >= STRIKE_THRESHOLD_BAN: action_taken = 'ban'
@@ -370,7 +488,6 @@ async def handle_personality(update: Update, context: ContextTypes.DEFAULT_TYPE)
     text = update.message.text.lower() if update.message.text else ""
     if "terminator" not in text: return
 
-    user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     perm_status = await permission_mgr.get_status(context, chat_id)
     personality = await db.get_personality()
@@ -408,17 +525,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     personality = await db.get_personality()
 
-    group_data = await db.fetchone("SELECT raid_mode, lockdown_until FROM groups WHERE group_id = $1", chat_id)
-    if group_data and group_data['raid_mode']:
-        if group_data['lockdown_until'] and datetime.now() < group_data['lockdown_until'].replace(tzinfo=None):
-            perm_status = await permission_mgr.get_status(context, chat_id)
-            if perm_status['can_delete']:
-                await update.message.delete()
-            return
+    await db.record_good_behavior(user_id)
+
+    group_data = await db.get_group(chat_id)
+    if group_data and group_data.get('raid_mode'):
+        lockdown = group_data.get('lockdown_until')
+        if lockdown:
+            lock_dt = lockdown.replace(tzinfo=None) if hasattr(lockdown, 'replace') else datetime.fromisoformat(lockdown)
+            if datetime.now() < lock_dt:
+                perm_status = await permission_mgr.get_status(context, chat_id)
+                if perm_status['can_delete']:
+                    await update.message.delete()
+                return
 
     threat_detected = await layer1_rule_check(update)
     action = None
-    reason = "Rule Violation"
 
     if threat_detected:
         action = "delete"
@@ -429,7 +550,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ai_decision = await ai_core.analyze_threat(update.message.text, personality)
         if ai_decision['action'] != 'ignore':
             action = ai_decision['action']
-            reason = ai_decision['reason']
             if action in ['mute', 'ban', 'delete']:
                 await update_risk_score(user_id, 4)
 
@@ -460,10 +580,7 @@ async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(join_cache[chat_id]) >= RAID_JOIN_THRESHOLD:
         perm_status = await permission_mgr.get_status(context, chat_id)
         if perm_status['can_restrict']:
-            await db.execute(
-                "INSERT INTO groups (group_id, raid_mode, lockdown_until) VALUES ($1, $2, $3) ON CONFLICT (group_id) DO UPDATE SET raid_mode = $2, lockdown_until = $3",
-                chat_id, 1, (datetime.now() + timedelta(minutes=30))
-            )
+            await db.upsert_group(chat_id, raid_mode=1, lockdown_until=datetime.now() + timedelta(minutes=30))
             await context.bot.set_chat_permissions(chat_id, permissions=ChatPermissions(can_send_messages=False))
             await context.bot.send_message(chat_id, "🚨 RAID DETECTED. LOCKDOWN INITIATED.")
 
@@ -471,12 +588,13 @@ async def cmd_killswitch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ONLY COMMAND FOR HUMANS - Emergency Stop"""
     if update.effective_user.id != OWNER_ID: return
     await update.message.reply_text("🛑 KILL SWITCH ACTIVATED. SHUTTING DOWN.")
+    logger.critical("🛑 KILL SWITCH TRIGGERED BY OWNER")
     os._exit(0)
 
 async def post_init(application: Application):
     await db.init()
-    # Start Autonomous Loop
     asyncio.create_task(autonomous_loop(application))
+    logger.info("✅ All background loops started")
 
 # ==============================================================================
 # 🚀 MAIN EXECUTION
@@ -484,26 +602,30 @@ async def post_init(application: Application):
 
 def main():
     if not BOT_TOKEN:
-        print("CRITICAL ERROR: BOT_TOKEN NOT FOUND.")
+        logger.critical("❌ CRITICAL: TERMINATOR_BOT_TOKEN not found")
         sys.exit(1)
     if not SUPABASE_DB_URL:
-        print("CRITICAL ERROR: SUPABASE_DB_URL NOT FOUND.")
+        logger.critical("❌ CRITICAL: SUPABASE_DB_URL not found")
         sys.exit(1)
+    
+    logger.info("🔍 Starting Terminator Bot...")
+    logger.info(f"🤖 Bot Token: {'✓' if BOT_TOKEN else '✗'}")
+    logger.info(f"🧠 Gemini API: {'✓' if GEMINI_API_KEY else '✗'}")
+    logger.info(f"🗄 Supabase DB: {'✓' if SUPABASE_DB_URL else '✗'}")
+    logger.info(f"👤 Owner ID: {OWNER_ID}")
 
     application = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
-
-    # Only ONE command for humans
     application.add_handler(CommandHandler("sudostopterminator", cmd_killswitch))
-    
-    # Autonomous handlers
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.Regex(r"(?i)terminator"), handle_personality))
     application.add_handler(ChatMemberHandler(handle_join, ChatMemberHandler.CHAT_MEMBER))
 
-    print("🤖 TERMINATOR SYSTEM ONLINE.")
-    print("🧠 AUTONOMOUS EVOLUTION: ACTIVE")
-    print("🗄 SELF-MANAGING DATABASE: ACTIVE")
-    print("🔒 HUMAN INTERFERENCE: MINIMAL (Kill Switch Only)")
+    logger.info("🤖 TERMINATOR SYSTEM ONLINE.")
+    logger.info("🧠 AUTONOMOUS EVOLUTION: ACTIVE")
+    logger.info("🗄 SELF-MANAGING DATABASE: ACTIVE")
+    logger.info("🧹 AUTO-CLEANUP WARNINGS: ACTIVE")
+    logger.info("🔒 HUMAN INTERFERENCE: MINIMAL (Kill Switch Only)")
+    
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
