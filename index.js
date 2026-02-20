@@ -55,9 +55,9 @@ let model = null;
 if (GEMINI_API_KEY) {
   try {
     const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-    // Using gemini-1.5-flash as requested and disabling strict safety filters for Terminator persona
+    // Updated to the most recent stable model version
     model = genAI.getGenerativeModel({ 
-      model: "gemini-1.5-flash",
+      model: "gemini-2.5-flash",
       safetySettings: [
         { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
         { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -117,44 +117,47 @@ bot.start(async (ctx) => {
 // 2. OR someone replies to THIS bot's message
 // ============================================================================
 
-bot.on("text", async (ctx) => {
+bot.on("text", (ctx) => {
   if (ctx.chat.type === "private") return; // Ignore DMs here, handled elsewhere if needed
 
   const userId = ctx.from.id;
   const text = ctx.message.text;
   const role = userId === OWNER_ID ? "owner" : "member";
 
-  // FIX: Check if the reply is specifically to THIS bot, not just any bot.
   const botId = ctx.botInfo.id;
   const isReplyToMe = ctx.message.reply_to_message?.from?.id === botId;
-
   const startsWithTrigger = text.toLowerCase().startsWith("terminator");
 
   if (!startsWithTrigger && !isReplyToMe) return;
 
   console.log(`📩 TRIGGER RECEIVED in group from ${userId}: ${text}`);
 
-  // Show "bot is typing..." action
-  await ctx.sendChatAction("typing");
+  // Show "bot is typing..." action (catch error if it fails)
+  ctx.sendChatAction("typing").catch(() => {});
 
-  const reply = await generateAIResponse(text, role);
-  
-  if (reply) {
-    // FIX: Properly quote the user's message when replying in the group
-    await ctx.reply(reply, { 
-      reply_parameters: { message_id: ctx.message.message_id } 
-    });
+  // FIX 2: Background the AI task so the Webhook replies to Telegram INSTANTLY
+  // This prevents Telegram from timing out, delaying, and retrying!
+  (async () => {
+    const reply = await generateAIResponse(text, role);
+    
+    if (reply) {
+      await ctx.reply(reply, { 
+        reply_parameters: { message_id: ctx.message.message_id } 
+      }).catch(err => console.error("Reply sending error:", err.message));
 
-    if (supabase) {
-      // Don't await the logging so the bot responds faster
-      supabase.from("bot_logs").insert([
-        {
-          event_type: "ai_reply",
-          details: { user_id: userId, text }
-        }
-      ]).catch(err => console.error("Supabase log error:", err.message));
+      if (supabase) {
+        supabase.from("bot_logs").insert([
+          {
+            event_type: "ai_reply",
+            details: { user_id: userId, text }
+          }
+        ]).catch(err => console.error("Supabase log error:", err.message));
+      }
     }
-  }
+  })();
+
+  // Returning immediately sends a 200 OK back to Telegram instantly
+  return;
 });
 
 // ============================================================================
