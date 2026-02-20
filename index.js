@@ -5,7 +5,7 @@
 import express from "express";
 import { Telegraf } from "telegraf";
 import { createClient } from "@supabase/supabase-js";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold } from "@google/generative-ai";
 
 // ============================================================================
 // 🔐 ENV CONFIG
@@ -55,8 +55,16 @@ let model = null;
 if (GEMINI_API_KEY) {
   try {
     const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
-    // Using gemini-1.5-flash as requested
-    model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    // Using gemini-1.5-flash as requested and disabling strict safety filters for Terminator persona
+    model = genAI.getGenerativeModel({ 
+      model: "gemini-1.5-flash",
+      safetySettings: [
+        { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+        { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+      ]
+    });
     console.log("✅ Gemini model ready");
   } catch (err) {
     console.error("❌ Gemini init failed:", err.message);
@@ -87,8 +95,9 @@ ${text}
     const result = await model.generateContent(prompt);
     return result.response.text();
   } catch (err) {
-    console.error("AI error:", err.message);
-    return "Error processing query. My neural net is temporarily disrupted.";
+    console.error("AI error:", err);
+    // Now prints the exact error into Telegram so we can debug it!
+    return `Error processing query. My neural net is temporarily disrupted.\n\n[DEBUG REASON]: ${err.message}`;
   }
 }
 
