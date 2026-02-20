@@ -1,4 +1,5 @@
 python-telegram-bot>=20.0
-google-generativeai
+google-generativeai>=0.8.0
 asyncpg
 python-dotenv
+langdetect
