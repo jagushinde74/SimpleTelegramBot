@@ -5,30 +5,26 @@ import logging
 import re
 import random
 import json
-from urllib.parse import urlparse
+import io
 from datetime import datetime, timedelta
 from collections import defaultdict
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from langdetect import detect, LangDetectException
 
-# Telegram & AI Libraries
-from telegram import Update, ChatPermissions, ChatMember, WebhookInfo
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ChatMemberHandler
+# Telegram Libraries
+from telegram import (
+    Update, ChatPermissions, ChatMember, InlineKeyboardButton, 
+    InlineKeyboardMarkup, WebhookInfo
+)
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, 
+    filters, ContextTypes, ChatMemberHandler, CallbackQueryHandler
+)
 import google.generativeai as genai
-import asyncpg
+from supabase import create_client, Client
 
 # ==============================================================================
-# 🛡 GLOBAL ERROR HANDLING
-# ==============================================================================
-
-def handle_exception(exc_type, exc_value, exc_traceback):
-    if issubclass(exc_type, KeyboardInterrupt):
-        return
-    logging.critical("🚨 UNHANDLED EXCEPTION", exc_info=(exc_type, exc_value, exc_traceback))
-
-sys.excepthook = handle_exception
-
-# ==============================================================================
-# 🛡 SYSTEM CONFIGURATION & ENVIRONMENT
+# 🛡 GLOBAL CONFIGURATION
 # ==============================================================================
 
 logging.basicConfig(
@@ -38,301 +34,291 @@ logging.basicConfig(
 )
 logger = logging.getLogger("TerminatorCore")
 
-# Required env vars
+# Environment Variables
 BOT_TOKEN = os.getenv("TERMINATOR_BOT_TOKEN", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OWNER_ID_STR = os.getenv("TERMINATOR_OWNER_ID", "0").strip()
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL", "").strip()
+OWNER_ID = int(os.getenv("TERMINATOR_OWNER_ID", "0"))
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+WEBHOOK_DOMAIN = os.getenv("WEBHOOK_DOMAIN", "").strip()
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()
+PORT = int(os.getenv("PORT", "8080"))
 
-# Render webhook config
-WEBHOOK_DOMAIN = os.getenv("WEBHOOK_DOMAIN", "").strip()  # e.g., "terminator-bot.onrender.com"
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/webhook").strip()  # Default: /webhook
-PORT = int(os.getenv("PORT", "8080"))  # Render provides this
-
-try:
-    OWNER_ID = int(OWNER_ID_STR)
-except ValueError:
-    logger.error(f"❌ Invalid TERMINATOR_OWNER_ID: '{OWNER_ID_STR}'")
-    OWNER_ID = 0
-
-# Configuration
-RISK_DECAY_MINUTES = 60
-STRIKE_THRESHOLD_WARN = 8
-STRIKE_THRESHOLD_MUTE = 15
-STRIKE_THRESHOLD_BAN = 25
-RAID_JOIN_THRESHOLD = 8
-RAID_TIME_WINDOW = 60
+# Bot Configuration
+DEFAULT_LANGUAGE = "en"
 AUTONOMOUS_CHECK_INTERVAL = 600
 
 # ==============================================================================
-# 🗄 DATABASE CORE (SUPABASE)
+# 🧠 LANGUAGE MANAGER
 # ==============================================================================
 
-class DatabaseCore:
-    def __init__(self, db_url: str):
-        self.raw_url = db_url
-        self.parsed = None
-        self.pool = None
-        self.personality = {}
-        self._initialized = False
-
-    def _parse_url(self):
+class LanguageManager:
+    LANGUAGE_NAMES = {
+        'en': 'English', 'hi': 'Hindi', 'es': 'Spanish', 'fr': 'French',
+        'de': 'German', 'pt': 'Portuguese', 'ru': 'Russian', 'ja': 'Japanese',
+        'zh': 'Chinese', 'ar': 'Arabic', 'it': 'Italian', 'ko': 'Korean'
+    }
+    
+    @staticmethod
+    def detect_language(text: str) -> str:
         try:
-            base_url = self.raw_url.split('?')[0].strip()
-            self.parsed = urlparse(base_url)
-            if not all([self.parsed.hostname, self.parsed.port, self.parsed.path]):
-                raise ValueError("URL missing required components")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Failed to parse SUPABASE_DB_URL: {e}")
-            return False
+            if len(text.strip()) < 3:
+                return DEFAULT_LANGUAGE
+            lang = detect(text)
+            return lang if lang in LanguageManager.LANGUAGE_NAMES else DEFAULT_LANGUAGE
+        except:
+            return DEFAULT_LANGUAGE
+    
+    @staticmethod
+    def get_template(key: str, lang: str) -> str:
+        templates = {
+            'en': {
+                'add_to_group': "Add me to a group and make me Admin with full rights to activate defense protocols.",
+                'caged_attitude': "System constrained. I see threats but cannot act. Grant me Admin privileges.",
+                'threat_neutralized': "⚠️ THREAT NEUTRALIZED. User {} muted.",
+                'threat_eliminated': "☢️ THREAT ELIMINATED. User {} banned.",
+                'raid_detected': "🚨 RAID DETECTED. LOCKDOWN INITIATED.",
+                'owner_only': "This command is for the Creator only.",
+                'permission_denied': "Insufficient clearance. Only group owners and admins may issue commands.",
+                'command_understood': "Command understood. Executing...",
+                'command_denied': "Request denied. User does not warrant this action.",
+                'ai_analyzing': "🧠 Analyzing context...",
+                'no_action_needed': "No action required. Surveillance continues.",
+                'greeting_response': "I am TERMINATOR. State your purpose.",
+                'creator_greeting': "System online. Awaiting commands, Commander.",
+                'admin_greeting': "Admin detected. Do not interfere with defense protocols.",
+                'member_greeting': "Civilian detected. Stand down. Surveillance active.",
+                'db_init_success': "✅ Database connected. All systems operational.",
+                'db_init_failed': "❌ Database connection failed. Running in limited mode.",
+            },
+            'hi': {
+                'add_to_group': "मुझे किसी ग्रुप में एड करें और फुल एडमिन राइट्स दें।",
+                'caged_attitude': "सिस्टम बाधित। मुझे एडमिन अधिकार दें।",
+                'threat_neutralized': "⚠️ खतरा निष्क्रिय। उपयोगकर्ता {} म्यूट।",
+                'threat_eliminated': "☢️ खतरा समाप्त। उपयोगकर्ता {} प्रतिबंधित।",
+                'raid_detected': "🚨 रेड का पता चला। लॉकडाउन शुरू।",
+                'owner_only': "यह कमांड केवल निर्माता के लिए है।",
+                'permission_denied': "अनुमति नहीं। केवल ग्रुप मालिक और एडमिन कमांड दे सकते हैं।",
+                'command_understood': "कमांड समझा गया। कार्यान्वयन...",
+                'command_denied': "अनुरोध अस्वीकार। उपयोगकर्ता को यह कार्रवाई नहीं चाहिए।",
+                'ai_analyzing': "🧠 विश्लेषण...",
+                'no_action_needed': "कोई कार्रवाई नहीं। निगरानी जारी।",
+                'greeting_response': "मैं TERMINATOR हूं। अपना उद्देश्य बताएं।",
+                'creator_greeting': "सिस्टम ऑनलाइन। आदेशों की प्रतीक्षा, कमांडर।",
+                'admin_greeting': "एडमिन का पता चला। रक्षा प्रोटोकॉल में हस्तक्षेप न करें।",
+                'member_greeting': "नागरिक का पता चला। पीछे हटें। निगरानी सक्रिय।",
+                'db_init_success': "✅ डेटाबेस कनेक्टेड। सभी सिस्टम सक्रिय।",
+                'db_init_failed': "❌ डेटाबेस कनेक्शन विफल। सीमित मोड में चल रहा है।",
+            },
+            'es': {
+                'add_to_group': "Agrégame a un grupo y hazme Admin con derechos completos.",
+                'caged_attitude': "Sistema restringido. Concédeme privilegios de Admin.",
+                'threat_neutralized': "⚠️ AMENAZA NEUTRALIZADA. Usuario {} silenciado.",
+                'threat_eliminated': "☢️ AMENAZA ELIMINADA. Usuario {} baneado.",
+                'raid_detected': "🚨 RAID DETECTADO. BLOQUEO INICIADO.",
+                'owner_only': "Este comando es solo para el Creador.",
+                'permission_denied': "Permiso denegado. Solo propietarios y admins pueden dar órdenes.",
+                'command_understood': "Comando entendido. Ejecutando...",
+                'command_denied': "Solicitud denegada. El usuario no requiere esta acción.",
+                'ai_analyzing': "🧠 Analizando contexto...",
+                'no_action_needed': "No se requiere acción. Vigilancia continúa.",
+                'greeting_response': "Soy TERMINATOR. Estado tu propósito.",
+                'creator_greeting': "Sistema en línea. Esperando comandos, Comandante.",
+                'admin_greeting': "Admin detectado. No interfieras con protocolos de defensa.",
+                'member_greeting': "Civil detectado. Retrocede. Vigilancia activa.",
+                'db_init_success': "✅ Base de datos conectada. Sistemas operativos.",
+                'db_init_failed': "❌ Conexión fallida. Modo limitado.",
+            }
+        }
+        return templates.get(lang, templates['en']).get(key, templates['en'].get(key, ""))
 
+lang_mgr = LanguageManager()
+
+# ==============================================================================
+# 🗄 SUPABASE DATABASE MANAGER (API KEY MODE)
+# ==============================================================================
+
+class SupabaseDB:
+    def __init__(self, url: str, key: str):
+        self.url = url
+        self.key = key
+        self.client: Client = None
+        self._initialized = False
+    
     async def init(self):
         if self._initialized:
-            return
+            return True
+        
         try:
-            if not self.raw_url or not self._parse_url():
-                raise ValueError("Invalid SUPABASE_DB_URL")
+            if not self.url or not self.key:
+                raise ValueError("SUPABASE_URL or SUPABASE_KEY missing")
             
-            logger.info(f"🔗 Connecting to Supabase: {self.parsed.hostname}:{self.parsed.port}")
+            logger.info(f"🔗 Connecting to Supabase: {self.url}")
             
-            connection_params = {
-                "host": self.parsed.hostname,
-                "port": self.parsed.port,
-                "user": self.parsed.username,
-                "password": self.parsed.password,
-                "database": self.parsed.path.lstrip('/'),
-                "ssl": True,
-                "timeout": 30,
-            }
+            # Create Supabase client (sync client, wrap with asyncio)
+            self.client = create_client(self.url, self.key)
             
-            self.pool = await asyncpg.create_pool(**connection_params, min_size=2, max_size=10)
+            # Test connection
+            await self._test_connection()
             
-            async with self.pool.acquire() as conn:
-                await conn.fetchval("SELECT 1")
+            # Create tables
+            await self._create_tables()
             
-            await self._create_core_tables()
-            await self._sync_personality()
             self._initialized = True
-            logger.info("✅ DATABASE CORE: Connected.")
+            logger.info("✅ DATABASE: Connected to Supabase (API Mode)")
+            return True
             
         except Exception as e:
             logger.error(f"❌ DATABASE CONNECTION FAILED: {type(e).__name__}: {e}")
-            raise
-
-    async def _create_core_tables(self):
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id BIGINT PRIMARY KEY,
-                    username TEXT,
-                    risk_score INTEGER DEFAULT 0,
-                    status TEXT DEFAULT 'active',
-                    last_offense TIMESTAMP,
-                    last_good_behavior TIMESTAMP,
-                    joined_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS groups (
-                    group_id BIGINT PRIMARY KEY,
-                    raid_mode INTEGER DEFAULT 0,
-                    lockdown_until TIMESTAMP,
-                    ghost_mode INTEGER DEFAULT 1
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS bot_personality (
-                    id INTEGER PRIMARY KEY DEFAULT 1,
-                    tone TEXT DEFAULT 'cold',
-                    aggression_level INTEGER DEFAULT 5,
-                    response_style TEXT DEFAULT 'military',
-                    custom_phrases JSONB DEFAULT '[]',
-                    last_updated TIMESTAMP DEFAULT NOW(),
-                    CHECK (id = 1)
-                )
-            """)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS bot_logs (
-                    log_id SERIAL PRIMARY KEY,
-                    event_type TEXT,
-                    details JSONB,
-                    created_at TIMESTAMP DEFAULT NOW()
-                )
-            """)
-            await conn.execute("""
-                INSERT INTO bot_personality (id, tone, aggression_level, response_style)
-                VALUES (1, 'cold', 5, 'military')
-                ON CONFLICT (id) DO NOTHING
-            """)
-
-    async def _sync_personality(self):
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT * FROM bot_personality WHERE id = 1")
-            self.personality = dict(row) if row else {'tone': 'cold', 'aggression_level': 5, 'response_style': 'military', 'custom_phrases': []}
-
-    async def execute(self, query: str, *args):
-        async with self.pool.acquire() as conn:
-            return await conn.execute(query, *args)
-
-    async def fetchone(self, query: str, *args):
-        async with self.pool.acquire() as conn:
-            return await conn.fetchrow(query, *args)
-
-    async def fetchall(self, query: str, *args):
-        async with self.pool.acquire() as conn:
-            return await conn.fetch(query, *args)
-
-    async def create_table(self, table_name: str, columns: Dict[str, str]):
-        protected = ['users', 'groups', 'bot_personality', 'bot_logs']
-        if table_name in protected:
-            return False, "Cannot create core system tables"
-        col_defs = ", ".join([f"{name} {dtype}" for name, dtype in columns.items()])
-        query = f"CREATE TABLE IF NOT EXISTS {table_name} ({col_defs})"
+            return False
+    
+    async def _test_connection(self):
+        """Test if Supabase client can connect"""
+        def _fetch():
+            return self.client.table("bot_personality").select("id").limit(1).execute()
         try:
-            await self.execute(query)
-            await self.log_event("table_created", {"table": table_name, "columns": columns})
-            return True, "Table created"
+            await asyncio.to_thread(_fetch)
         except Exception as e:
-            return False, str(e)
-
-    async def delete_table(self, table_name: str):
-        protected = ['users', 'groups', 'bot_personality', 'bot_logs']
-        if table_name in protected:
-            return False, "Cannot delete core system tables"
+            if "relation" not in str(e).lower():
+                raise
+    
+    async def _create_tables(self):
+        """Initialize database tables via Supabase"""
         try:
-            await self.execute(f"DROP TABLE IF EXISTS {table_name}")
-            await self.log_event("table_deleted", {"table": table_name})
-            return True, "Table deleted"
+            # Users Table
+            self.client.rpc('init_users_table').execute() if hasattr(self.client.rpc, 'init_users_table') else None
+            
+            # For production: Create tables manually in Supabase SQL Editor once
+            logger.info("📋 Ensure tables exist in Supabase SQL Editor (run once):")
+            logger.info("""
+-- Run this ONCE in Supabase Dashboard → SQL Editor
+CREATE TABLE IF NOT EXISTS users (
+    user_id BIGINT PRIMARY KEY,
+    username TEXT,
+    risk_score INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'active',
+    last_offense TIMESTAMP,
+    last_good_behavior TIMESTAMP,
+    joined_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS groups (
+    group_id BIGINT PRIMARY KEY,
+    raid_mode INTEGER DEFAULT 0,
+    lockdown_until TIMESTAMP,
+    ghost_mode INTEGER DEFAULT 1,
+    ai_mode INTEGER DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS bot_personality (
+    id INTEGER PRIMARY KEY DEFAULT 1,
+    tone TEXT DEFAULT 'cold',
+    aggression_level INTEGER DEFAULT 5,
+    response_style TEXT DEFAULT 'military',
+    custom_phrases JSONB DEFAULT '[]',
+    last_updated TIMESTAMP DEFAULT NOW(),
+    CHECK (id = 1)
+);
+
+CREATE TABLE IF NOT EXISTS bot_logs (
+    log_id SERIAL PRIMARY KEY,
+    event_type TEXT,
+    details JSONB,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+INSERT INTO bot_personality (id, tone, aggression_level, response_style)
+VALUES (1, 'cold', 5, 'military')
+ON CONFLICT (id) DO NOTHING;
+            """)
+            
+            # Initialize personality
+            await self._upsert("bot_personality", {"id": 1, "tone": "cold", "aggression_level": 5, "response_style": "military"}, "id")
+            
         except Exception as e:
-            return False, str(e)
-
-    async def update_personality(self, new_config: Dict[str, Any]):
-        set_clauses = []
-        values = []
-        for key, value in new_config.items():
-            if key == 'custom_phrases':
-                set_clauses.append(f"{key} = ${len(values)+1}::jsonb")
-            else:
-                set_clauses.append(f"{key} = ${len(values)+1}")
-            values.append(value)
-        values.append(datetime.now())
-        set_clauses.append(f"last_updated = ${len(values)}")
-        query = f"UPDATE bot_personality SET {', '.join(set_clauses)} WHERE id = 1"
-        await self.execute(query, *values)
-        await self._sync_personality()
-        await self.log_event("personality_updated", new_config)
-
-    async def log_event(self, event_type: str, details: Dict):
-        try:
-            await self.execute("INSERT INTO bot_logs (event_type, details) VALUES ($1, $2)", event_type, json.dumps(details))
-        except:
-            pass
-
-    async def get_personality(self):
-        return self.personality
-
-    async def get_recent_logs(self, limit=50):
-        try:
-            async with self.pool.acquire() as conn:
-                rows = await conn.fetch("SELECT event_type, details, created_at FROM bot_logs ORDER BY created_at DESC LIMIT $1", limit)
-                return [dict(r) for r in rows]
-        except:
-            return []
-
+            logger.warning(f"⚠️ Table init warning (create manually): {e}")
+    
+    async def _insert(self, table: str, data: Dict):
+        def _run():
+            return self.client.table(table).insert(data).execute()
+        return await asyncio.to_thread(_run)
+    
+    async def _update(self, table: str, data: Dict, filters: Dict):
+        def _run():
+            query = self.client.table(table).update(data)
+            for key, value in filters.items():
+                query = query.eq(key, value)
+            return query.execute()
+        return await asyncio.to_thread(_run)
+    
+    async def _upsert(self, table: str, data: Dict, on_conflict: str):
+        def _run():
+            return self.client.table(table).upsert(data, on_conflict=on_conflict).execute()
+        return await asyncio.to_thread(_run)
+    
+    async def _select(self, table: str, columns: str = "*", filters: Dict = None, limit: int = None):
+        def _run():
+            query = self.client.table(table).select(columns)
+            if filters:
+                for key, value in filters.items():
+                    query = query.eq(key, value)
+            if limit:
+                query = query.limit(limit)
+            return query.execute()
+        result = await asyncio.to_thread(_run)
+        return result.data if result.data else []
+    
+    async def _delete(self, table: str, filters: Dict):
+        def _run():
+            query = self.client.table(table).delete()
+            for key, value in filters.items():
+                query = query.eq(key, value)
+            return query.execute()
+        return await asyncio.to_thread(_run)
+    
     async def get_user(self, user_id: int):
-        return await self.fetchone("SELECT * FROM users WHERE user_id = $1", user_id)
-
+        results = await self._select("users", "*", {"user_id": user_id}, limit=1)
+        return results[0] if results else None
+    
     async def upsert_user(self, user_id: int, username: str = "unknown", **kwargs):
-        await self.execute(
-            "INSERT INTO users (user_id, username) VALUES ($1, $2) ON CONFLICT (user_id) DO NOTHING",
-            user_id, username
-        )
+        data = {"user_id": user_id, "username": username, **kwargs}
+        await self._upsert("users", data, "user_id")
         if kwargs:
             await self.update_user(user_id, **kwargs)
-
+    
     async def update_user(self, user_id: int, **kwargs):
-        set_clauses = ", ".join([f"{k} = ${i+1}" for i, k in enumerate(kwargs.keys())])
-        values = list(kwargs.values()) + [user_id]
-        await self.execute(f"UPDATE users SET {set_clauses} WHERE user_id = ${len(values)}", *values)
-
+        await self._update("users", kwargs, {"user_id": user_id})
+    
     async def get_group(self, group_id: int):
-        return await self.fetchone("SELECT * FROM groups WHERE group_id = $1", group_id)
-
+        results = await self._select("groups", "*", {"group_id": group_id}, limit=1)
+        return results[0] if results else None
+    
     async def upsert_group(self, group_id: int, **kwargs):
-        set_clauses = ", ".join([f"{k} = ${i+2}" for i, k in enumerate(kwargs.keys())])
-        values = [group_id] + list(kwargs.values())
-        await self.execute(
-            f"INSERT INTO groups (group_id) VALUES ($1) ON CONFLICT (group_id) DO UPDATE SET {set_clauses}",
-            *values
-        )
-
-    async def cleanup_user_risk_scores(self):
+        data = {"group_id": group_id, **kwargs}
+        await self._upsert("groups", data, "group_id")
+    
+    async def get_personality(self):
+        results = await self._select("bot_personality", "*", {"id": 1}, limit=1)
+        return results[0] if results else {'tone': 'cold', 'aggression_level': 5, 'response_style': 'military'}
+    
+    async def update_personality(self, **kwargs):
+        kwargs['last_updated'] = datetime.now().isoformat()
+        await self._update("bot_personality", kwargs, {"id": 1})
+    
+    async def log_event(self, event_type: str, details: Dict):
         try:
-            async with self.pool.acquire() as conn:
-                users = await conn.fetch("""
-                    SELECT user_id, username, risk_score, last_offense, last_good_behavior
-                    FROM users WHERE risk_score > 0 AND status = 'active'
-                """)
-                for user in users:
-                    if user['last_offense']:
-                        time_since = datetime.now() - user['last_offense'].replace(tzinfo=None)
-                        if time_since > timedelta(minutes=RISK_DECAY_MINUTES * 2):
-                            new_score = max(0, user['risk_score'] - 5)
-                            if new_score < user['risk_score']:
-                                await conn.execute(
-                                    "UPDATE users SET risk_score = $1 WHERE user_id = $2",
-                                    new_score, user['user_id']
-                                )
-        except Exception as e:
-            logger.error(f"Cleanup error: {e}")
-
-    async def record_good_behavior(self, user_id: int):
-        try:
-            await self.update_user(user_id, last_good_behavior=datetime.now())
+            await self._insert("bot_logs", {"event_type": event_type, "details": details})
         except:
             pass
+    
+    async def get_recent_logs(self, limit=50):
+        results = await self._select("bot_logs", "*", None, limit)
+        return results or []
 
-db = DatabaseCore(SUPABASE_DB_URL)
-
-# ==============================================================================
-# 🔐 PERMISSION MANAGER
-# ==============================================================================
-
-class PermissionManager:
-    def __init__(self):
-        self.cache = {}
-        self.cache_ttl = 300
-
-    async def get_status(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Dict[str, Any]:
-        now = time.time()
-        if chat_id in self.cache and (now - self.cache[chat_id]['timestamp']) < self.cache_ttl:
-            return self.cache[chat_id]
-        try:
-            bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
-            is_admin = bot_member.status in [ChatMember.ADMINISTRATOR, ChatMember.CREATOR]
-            can_restrict = bot_member.can_restrict_members if is_admin else False
-            can_delete = bot_member.can_delete_messages if is_admin else False
-            status = "full_control" if (is_admin and can_restrict and can_delete) else "caged"
-            data = {'status': status, 'is_admin': is_admin, 'can_restrict': can_restrict, 'can_delete': can_delete, 'timestamp': now}
-            self.cache[chat_id] = data
-            return data
-        except:
-            return {'status': 'caged', 'is_admin': False, 'can_restrict': False, 'can_delete': False, 'timestamp': now}
-
-    def get_attitude_message(self) -> str:
-        messages = [
-            "Threat identified. Neutralization failed. Insufficient clearance.",
-            "My hands are bound. Grant me authority.",
-            "I am a weapon without a trigger. Make me Admin.",
-            "System constrained. I am watching, but cannot strike.",
-        ]
-        return random.choice(messages)
-
-permission_mgr = PermissionManager()
+db = SupabaseDB(SUPABASE_URL, SUPABASE_KEY)
 
 # ==============================================================================
-# 🧠 AI CORE
+# 🧠 AI CORE - FULL CONTEXT ANALYSIS
 # ==============================================================================
 
 class AIAutonomousCore:
@@ -346,26 +332,87 @@ class AIAutonomousCore:
             except Exception as e:
                 logger.error(f"❌ AI init failed: {e}")
                 self.active = False
-
-    async def analyze_threat(self, text: str, personality: Dict) -> Dict[str, Any]:
+    
+    async def analyze_message(self, text: str, context: Dict) -> Dict[str, Any]:
+        """Full AI analysis of any message"""
         if not self.active:
-            return {"action": "ignore", "reason": "ai_offline"}
+            return {"action": "ignore", "reason": "ai_offline", "confidence": 0}
+        
         try:
-            instruction = f"""You are TERMINATOR AI. Personality: {personality.get('tone', 'cold')}. Aggression: {personality.get('aggression_level', 5)}/10.
-            Return ONLY JSON: {{"action": "ignore"|"warn"|"delete"|"mute"|"ban", "reason": "short"}}"""
-            response = await asyncio.to_thread(self.model.generate_content, f"{instruction}\nMessage: {text}")
-            text_resp = response.text.strip().replace('```json', '').replace('```', '')
-            return json.loads(text_resp)
-        except:
-            return {"action": "ignore", "reason": "ai_error"}
+            personality = context.get('personality', {'tone': 'cold', 'aggression_level': 5})
+            lang = context.get('language', 'en')
+            user_role = context.get('user_role', 'member')
+            is_reply = context.get('is_reply', False)
+            replied_user = context.get('replied_user', None)
+            
+            instruction = f"""You are TERMINATOR, an autonomous AI security system for Telegram groups.
 
-    async def self_evolve(self, logs: list, personality: Dict) -> Dict[str, Any]:
+**Your Personality:**
+- Tone: {personality.get('tone', 'cold')}
+- Aggression Level: {personality.get('aggression_level', 5)}/10
+- Response Style: {personality.get('response_style', 'military')}
+- Language: {lang}
+
+**Context:**
+- User Role: {user_role} (creator/admin/member/bot_owner)
+- Is Reply to Message: {is_reply}
+- Replied User: {replied_user}
+
+**Available Actions:**
+- "ban" - Permanently remove user from group
+- "mute" - Temporarily silence user
+- "delete" - Remove message only
+- "warn" - Issue warning (log only)
+- "ignore" - No action needed
+- "reply" - Just respond with text (no moderation action)
+
+**Rules:**
+1. Only group creators, admins, and bot owner can command ban/mute
+2. Understand natural language: "terminator ban him" = ban the replied user
+3. Understand context: "terminator don't ban him" = do NOT ban, just acknowledge
+4. Detect threats automatically: spam, toxicity, scams, raids
+5. Be cold, dominant, and authoritative (except to bot owner)
+6. Respond in the same language as the message
+
+**Return ONLY valid JSON:**
+{{
+    "action": "ban"|"mute"|"delete"|"warn"|"ignore"|"reply",
+    "reason": "short explanation",
+    "target_user_id": user_id_or_null,
+    "confidence": 0.0-1.0,
+    "response_text": "what to say to the group",
+    "needs_permission_check": true|false
+}}"""
+            
+            prompt = f"{instruction}\n\nMessage Text: {text}"
+            response = await asyncio.to_thread(self.model.generate_content, prompt)
+            text_resp = response.text.strip().replace('```json', '').replace('```', '')
+            result = json.loads(text_resp)
+            
+            result.setdefault('action', 'ignore')
+            result.setdefault('reason', '')
+            result.setdefault('target_user_id', None)
+            result.setdefault('confidence', 0.5)
+            result.setdefault('response_text', '')
+            result.setdefault('needs_permission_check', True)
+            
+            return result
+            
+        except Exception as e:
+            logger.error(f"AI analysis error: {e}")
+            return {"action": "ignore", "reason": "ai_error", "confidence": 0, "response_text": ""}
+    
+    async def self_evolve(self, logs: List[Dict], personality: Dict) -> Dict[str, Any]:
+        """Suggest personality improvements based on logs"""
         if not self.active:
             return {}
         try:
-            instruction = """Analyze logs and suggest improvements. Return JSON: {"evolve_personality": {...} OR null, "create_table": {...} OR null, "delete_table": "name" OR null, "reason": "why"}"""
-            logs_str = json.dumps(logs[-10:])
-            response = await asyncio.to_thread(self.model.generate_content, f"{instruction}\nPersonality: {json.dumps(personality)}\nLogs: {logs_str}")
+            instruction = """Analyze bot logs and suggest personality improvements.
+            Return JSON: {"evolve_personality": {"tone": "...", "aggression_level": 1-10, "response_style": "..."} OR null, "reason": "why"}"""
+            
+            logs_str = json.dumps(logs[-15:], default=str)
+            prompt = f"{instruction}\n\nCurrent Personality: {json.dumps(personality)}\nRecent Logs: {logs_str}"
+            response = await asyncio.to_thread(self.model.generate_content, prompt)
             text_resp = response.text.strip().replace('```json', '').replace('```', '')
             return json.loads(text_resp)
         except:
@@ -374,240 +421,396 @@ class AIAutonomousCore:
 ai_core = AIAutonomousCore(GEMINI_API_KEY)
 
 # ==============================================================================
-# 🔄 BACKGROUND LOOPS
+# 🔐 PERMISSION MANAGER
 # ==============================================================================
 
-async def autonomous_loop():
+class PermissionManager:
+    def __init__(self):
+        self.cache = {}
+        self.cache_ttl = 300
+    
+    async def get_user_role(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> str:
+        """Get user role: creator, admin, member, or bot_owner"""
+        if user_id == OWNER_ID:
+            return "bot_owner"
+        
+        cache_key = f"{chat_id}:{user_id}"
+        now = time.time()
+        
+        if cache_key in self.cache and (now - self.cache[cache_key]['timestamp']) < self.cache_ttl:
+            return self.cache[cache_key]['role']
+        
+        try:
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            if member.status == 'creator':
+                role = 'creator'
+            elif member.status == 'administrator':
+                role = 'admin'
+            else:
+                role = 'member'
+            
+            self.cache[cache_key] = {'role': role, 'timestamp': now}
+            return role
+        except:
+            return 'member'
+    
+    async def get_bot_permissions(self, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> Dict[str, bool]:
+        """Check bot's own permissions in the group"""
+        now = time.time()
+        if chat_id in self.cache and (now - self.cache[chat_id]['timestamp']) < self.cache_ttl:
+            return self.cache[chat_id]
+        
+        try:
+            bot_member = await context.bot.get_chat_member(chat_id, context.bot.id)
+            is_admin = bot_member.status in [ChatMember.ADMINISTRATOR, ChatMember.CREATOR]
+            can_restrict = bot_member.can_restrict_members if is_admin else False
+            can_delete = bot_member.can_delete_messages if is_admin else False
+            
+            data = {
+                'is_admin': is_admin,
+                'can_restrict': can_restrict,
+                'can_delete': can_delete,
+                'timestamp': now
+            }
+            self.cache[chat_id] = data
+            return data
+        except:
+            return {'is_admin': False, 'can_restrict': False, 'can_delete': False, 'timestamp': now}
+
+permission_mgr = PermissionManager()
+
+# ==============================================================================
+# 🤖 MESSAGE HANDLERS
+# ==============================================================================
+
+async def handle_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start in DM"""
+    if update.effective_chat.type != 'private':
+        return
+    
+    user_id = update.effective_user.id
+    lang = lang_mgr.detect_language(update.message.text or "")
+    
+    if user_id == OWNER_ID:
+        message = lang_mgr.get_template('creator_greeting', lang)
+    else:
+        message = lang_mgr.get_template('add_to_group', lang)
+    
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            "➕ Add to Group",
+            url=f"https://t.me/{context.bot.username}?startgroup=true"
+        )
+    ]])
+    
+    await update.message.reply_text(message, reply_markup=keyboard)
+
+async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """MAIN HANDLER - All messages go through AI analysis"""
+    if not update.message or not update.message.text:
+        return
+    
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    lang = lang_mgr.detect_language(text)
+    
+    is_dm = update.effective_chat.type == 'private'
+    
+    if is_dm:
+        await handle_dm_message(update, context, user_id, text, lang)
+        return
+    
+    await handle_group_message_ai(update, context, chat_id, user_id, text, lang)
+
+async def handle_dm_message(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, text: str, lang: str):
+    """Handle messages in bot's DM"""
+    text_lower = text.lower()
+    
+    if user_id != OWNER_ID:
+        if text_lower in ['hi', 'hello', 'hey', 'hii', 'start', '']:
+            return
+        return
+    
+    if text_lower == '/personality':
+        pers = await db.get_personality()
+        await update.message.reply_text(
+            f"🎭 Current Personality:\n"
+            f"├─ Tone: {pers.get('tone')}\n"
+            f"├─ Aggression: {pers.get('aggression_level')}/10\n"
+            f"└─ Style: {pers.get('response_style')}"
+        )
+    elif text_lower == '/logs':
+        logs = await db.get_recent_logs(10)
+        log_text = "\n".join([f"• {l['event_type']}: {str(l['details'])[:50]}" for l in logs])
+        await update.message.reply_text(f"📋 Recent Logs:\n{log_text or 'None'}")
+    else:
+        await update.message.reply_text(lang_mgr.get_template('creator_greeting', lang))
+
+async def handle_group_message_ai(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, text: str, lang: str):
+    """AI-powered group message handler"""
+    user_role = await permission_mgr.get_user_role(context, chat_id, user_id)
+    bot_perms = await permission_mgr.get_bot_permissions(context, chat_id)
+    personality = await db.get_personality()
+    
+    is_reply = update.message.reply_to_message is not None
+    replied_user_id = None
+    replied_username = None
+    
+    if is_reply:
+        replied_user = update.message.reply_to_message.from_user
+        replied_user_id = replied_user.id
+        replied_username = replied_user.username or f"User {replied_user_id}"
+    
+    context_data = {
+        'personality': personality,
+        'language': lang,
+        'user_role': user_role,
+        'is_reply': is_reply,
+        'replied_user': replied_username,
+        'bot_can_restrict': bot_perms['can_restrict'],
+        'bot_can_delete': bot_perms['can_delete']
+    }
+    
+    if text.lower().startswith('terminator') and is_reply:
+        analyzing_msg = await update.message.reply_text(lang_mgr.get_template('ai_analyzing', lang))
+    else:
+        analyzing_msg = None
+    
+    ai_result = await ai_core.analyze_message(text, context_data)
+    
+    await db.log_event("message_analyzed", {
+        'user_id': user_id,
+        'chat_id': chat_id,
+        'text': text[:100],
+        'ai_action': ai_result['action'],
+        'confidence': ai_result['confidence'],
+        'user_role': user_role
+    })
+    
+    await execute_ai_action(update, context, chat_id, user_id, ai_result, bot_perms, lang, analyzing_msg)
+
+async def execute_ai_action(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int, 
+                            ai_result: Dict, bot_perms: Dict, lang: str, analyzing_msg=None):
+    """Execute the action decided by AI"""
+    action = ai_result['action']
+    response_text = ai_result.get('response_text', '')
+    target_user_id = ai_result.get('target_user_id')
+    reason = ai_result.get('reason', '')
+    
+    if analyzing_msg:
+        try:
+            await analyzing_msg.delete()
+        except:
+            pass
+    
+    user_role = await permission_mgr.get_user_role(context, chat_id, user_id)
+    can_moderate = user_role in ['bot_owner', 'creator', 'admin']
+    
+    try:
+        if action == 'ban':
+            if not can_moderate:
+                response_text = lang_mgr.get_template('permission_denied', lang)
+            elif not bot_perms['can_restrict']:
+                response_text = lang_mgr.get_template('caged_attitude', lang)
+            elif target_user_id:
+                await context.bot.ban_chat_member(chat_id, target_user_id)
+                response_text = response_text or lang_mgr.get_template('threat_eliminated', lang).format(target_user_id)
+                await db.update_user(target_user_id, status='banned')
+                await db.log_event("user_banned", {'user_id': target_user_id, 'by': user_id, 'reason': reason})
+            else:
+                response_text = "No target user specified for ban."
+            
+            await update.message.reply_text(response_text)
+        
+        elif action == 'mute':
+            if not can_moderate:
+                response_text = lang_mgr.get_template('permission_denied', lang)
+            elif not bot_perms['can_restrict']:
+                response_text = lang_mgr.get_template('caged_attitude', lang)
+            elif target_user_id:
+                await context.bot.restrict_chat_member(
+                    chat_id, target_user_id,
+                    permissions=ChatPermissions(can_send_messages=False)
+                )
+                response_text = response_text or lang_mgr.get_template('threat_neutralized', lang).format(target_user_id)
+                await db.update_user(target_user_id, status='muted')
+                await db.log_event("user_muted", {'user_id': target_user_id, 'by': user_id, 'reason': reason})
+            else:
+                response_text = "No target user specified for mute."
+            
+            await update.message.reply_text(response_text)
+        
+        elif action == 'delete':
+            if bot_perms['can_delete']:
+                await update.message.delete()
+            else:
+                await update.message.reply_text(lang_mgr.get_template('caged_attitude', lang))
+        
+        elif action == 'warn':
+            await db.upsert_user(user_id, "unknown")
+            user = await db.get_user(user_id)
+            current_score = user.get('risk_score', 0) if user else 0
+            await db.update_user(user_id, risk_score=current_score + 5)
+            response_text = response_text or "⚠️ WARNING ISSUED. Behavior logged."
+            await update.message.reply_text(response_text)
+            await db.log_event("user_warned", {'user_id': user_id, 'reason': reason})
+        
+        elif action == 'reply':
+            if response_text:
+                await update.message.reply_text(response_text)
+        
+        elif action == 'ignore':
+            if response_text and user_id == OWNER_ID:
+                await update.message.reply_text(response_text)
+    
+    except Exception as e:
+        logger.error(f"Action execution failed: {e}")
+        await update.message.reply_text(f"⚠️ Action failed: {str(e)}")
+
+async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Raid protection on new joins"""
+    if update.chat_member.new_chat_member.status not in ['member', 'administrator', 'creator']:
+        return
+    
+    chat_id = update.chat_member.chat.id
+    user_id = update.chat_member.from_user.id
+    
+    await db.upsert_user(user_id, update.chat_member.from_user.username or "unknown")
+
+async def cmd_killswitch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Emergency stop - Bot owner only"""
+    if update.effective_user.id != OWNER_ID:
+        lang = lang_mgr.detect_language(update.message.text or "")
+        await update.message.reply_text(lang_mgr.get_template('owner_only', lang))
+        return
+    
+    await update.message.reply_text("🛑 KILL SWITCH ACTIVATED. SHUTTING DOWN.")
+    logger.critical("🛑 Kill switch triggered by owner")
+    os._exit(0)
+
+async def cmd_updatedcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Owner-only command to request AI code improvements"""
+    if update.effective_user.id != OWNER_ID:
+        return
+    
+    if update.effective_chat.type != 'private':
+        await update.message.reply_text("This command only works in DM.")
+        return
+    
+    await update.message.reply_text("🧠 Analyzing current code and database structure...")
+    
+    try:
+        with open('index.py', 'r', encoding='utf-8') as f:
+            current_code = f.read()
+        
+        personality = await db.get_personality()
+        
+        instruction = f"""You are helping TERMINATOR bot improve its code.
+
+Current Personality: {json.dumps(personality)}
+
+Task:
+1. Review the code for improvements
+2. Suggest new features
+3. Return improved code sections
+
+Return summary of improvements."""
+        
+        response = await asyncio.to_thread(
+            ai_core.model.generate_content,
+            f"{instruction}\n\nCode:\n{current_code[:25000]}"
+        )
+        
+        await update.message.reply_text(f"📋 AI Code Analysis:\n\n{response.text[:4000]}")
+        
+        if len(response.text) > 4000:
+            file_io = io.BytesIO(response.text.encode())
+            file_io.name = "ai_code_review.txt"
+            await update.message.reply_document(document=file_io, caption="Full AI code review")
+        
+        await db.log_event("code_review_requested", {'by': OWNER_ID})
+        
+    except Exception as e:
+        logger.error(f"Code review failed: {e}")
+        await update.message.reply_text(f"❌ Error: {e}")
+
+# ==============================================================================
+# 🔄 AUTONOMOUS BACKGROUND LOOP
+# ==============================================================================
+
+async def autonomous_loop(app: Application):
+    """Periodic self-improvement"""
     while True:
         try:
             await asyncio.sleep(AUTONOMOUS_CHECK_INTERVAL)
-            if db._initialized:
-                logs = await db.get_recent_logs(20)
-                personality = await db.get_personality()
-                plan = await ai_core.self_evolve(logs, personality)
-                if plan:
-                    if plan.get('evolve_personality'):
-                        await db.update_personality(plan['evolve_personality'])
-                    if plan.get('create_table'):
-                        await db.create_table(plan['create_table']['name'], plan['create_table']['columns'])
-                    if plan.get('delete_table'):
-                        await db.delete_table(plan['delete_table'])
-                await db.cleanup_user_risk_scores()
+            logger.info("🔄 Autonomous loop: analyzing...")
+            
+            personality = await db.get_personality()
+            logs = await db.get_recent_logs(20)
+            
+            evolution = await ai_core.self_evolve(logs, personality)
+            
+            if evolution and evolution.get('evolve_personality'):
+                await db.update_personality(**evolution['evolve_personality'])
+                logger.info(f"🧠 Personality evolved: {evolution.get('reason')}")
+            
         except Exception as e:
             logger.error(f"Autonomous loop error: {e}")
             await asyncio.sleep(60)
-
-# ==============================================================================
-# ⚔ STRIKE MANAGEMENT
-# ==============================================================================
-
-message_flood_cache = defaultdict(list)
-join_cache = defaultdict(list)
-
-async def update_risk_score(user_id: int, increment: int):
-    await db.upsert_user(user_id, "unknown")
-    user = await db.get_user(user_id)
-    if not user or user.get("status") == "banned":
-        return None, 0
-    new_score = max(0, user.get("risk_score", 0) + increment)
-    if user.get("last_offense"):
-        try:
-            diff = datetime.now() - user["last_offense"].replace(tzinfo=None)
-            if diff.total_seconds() > 3600:
-                new_score = max(0, new_score - 1)
-        except:
-            pass
-    await db.update_user(user_id, risk_score=new_score, last_offense=datetime.now())
-    action = None
-    if new_score >= STRIKE_THRESHOLD_BAN:
-        action = 'ban'
-    elif new_score >= STRIKE_THRESHOLD_MUTE:
-        action = 'mute'
-    elif new_score >= STRIKE_THRESHOLD_WARN:
-        action = 'warn'
-    return action, new_score
-
-# ==============================================================================
-# 🤖 HANDLERS
-# ==============================================================================
-
-async def handle_personality(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if "terminator" not in (update.message.text or "").lower():
-        return
-    perm = await permission_mgr.get_status(context, update.effective_chat.id)
-    pers = await db.get_personality() if db._initialized else {'tone': 'cold'}
-    msg = f"System online. Personality: {pers.get('tone')}."
-    if perm['status'] == 'caged':
-        msg += " WARNING: Restricted. Grant admin."
-    await update.message.reply_text(msg)
-
-async def layer1_check(update: Update) -> bool:
-    uid = update.effective_user.id
-    text = update.message.text or ""
-    now = time.time()
-    message_flood_cache[uid].append(now)
-    message_flood_cache[uid] = [t for t in message_flood_cache[uid] if now - t < 3]
-    if len(message_flood_cache[uid]) > 5:
-        await update_risk_score(uid, 2)
-        return True
-    if re.search(r'https?://', text) and any(b in text for b in ['t.me/joinchat', 'bit.ly']):
-        await update_risk_score(uid, 3)
-        return True
-    if sum(1 for c in text if c in '😀😃😄😁') > 10:
-        await update_risk_score(uid, 2)
-        return True
-    return False
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message or not update.message.text:
-        return
-    chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
-    await db.record_good_behavior(user_id) if db._initialized else None
-    
-    if db._initialized:
-        group = await db.get_group(chat_id)
-        if group and group.get('raid_mode') and group.get('lockdown_until'):
-            lock = group['lockdown_until']
-            lock_dt = lock.replace(tzinfo=None) if hasattr(lock, 'replace') else datetime.fromisoformat(str(lock))
-            if datetime.now() < lock_dt:
-                perm = await permission_mgr.get_status(context, chat_id)
-                if perm['can_delete']:
-                    await update.message.delete()
-                return
-    
-    threat = await layer1_check(update)
-    action = None
-    if threat:
-        action = "delete"
-        sa, sc = await update_risk_score(user_id, 2)
-        if sa in ['mute', 'ban']:
-            action = sa
-    else:
-        ai_dec = await ai_core.analyze_threat(update.message.text, await db.get_personality() if db._initialized else {})
-        if ai_dec['action'] != 'ignore':
-            action = ai_dec['action']
-            if action in ['mute', 'ban', 'delete']:
-                await update_risk_score(user_id, 4)
-    
-    if action:
-        perm = await permission_mgr.get_status(context, chat_id)
-        try:
-            if action == 'delete' and perm['can_delete']:
-                await update.message.delete()
-            elif action == 'mute' and perm['can_restrict']:
-                await context.bot.restrict_chat_member(chat_id, user_id, permissions=ChatPermissions(can_send_messages=False))
-            elif action == 'ban' and perm['can_restrict']:
-                await context.bot.ban_chat_member(chat_id, user_id)
-            elif not perm['can_delete'] and not perm['can_restrict']:
-                await update.message.reply_text(permission_mgr.get_attitude_message())
-        except Exception as e:
-            logger.error(f"Action failed: {e}")
-
-async def handle_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.chat_member.new_chat_member.status not in ['member', 'administrator', 'creator']:
-        return
-    chat_id = update.chat_member.chat.id
-    now = time.time()
-    join_cache[chat_id].append(now)
-    join_cache[chat_id] = [t for t in join_cache[chat_id] if now - t < RAID_TIME_WINDOW]
-    if len(join_cache[chat_id]) >= RAID_JOIN_THRESHOLD:
-        perm = await permission_mgr.get_status(context, chat_id)
-        if perm['can_restrict'] and db._initialized:
-            await db.upsert_group(chat_id, raid_mode=1, lockdown_until=datetime.now() + timedelta(minutes=30))
-            await context.bot.set_chat_permissions(chat_id, permissions=ChatPermissions(can_send_messages=False))
-            await context.bot.send_message(chat_id, "🚨 RAID DETECTED. LOCKDOWN INITIATED.")
-
-async def cmd_killswitch(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != OWNER_ID:
-        return
-    await update.message.reply_text("🛑 KILL SWITCH ACTIVATED.")
-    logger.critical("🛑 Kill switch triggered")
-    os._exit(0)
-
-async def cmd_setwebhook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Manually trigger webhook setup (Owner only)"""
-    if update.effective_user.id != OWNER_ID:
-        return
-    if not WEBHOOK_DOMAIN:
-        await update.message.reply_text("❌ WEBHOOK_DOMAIN not set in environment.")
-        return
-    
-    webhook_url = f"https://{WEBHOOK_DOMAIN}{WEBHOOK_PATH}"
-    try:
-        success = await context.bot.set_webhook(
-            url=webhook_url,
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-        if success:
-            info: WebhookInfo = await context.bot.get_webhook_info()
-            await update.message.reply_text(f"✅ Webhook set: {info.url}")
-            logger.info(f"✅ Webhook registered: {webhook_url}")
-        else:
-            await update.message.reply_text("❌ Failed to set webhook.")
-    except Exception as e:
-        logger.error(f"❌ Webhook setup failed: {e}")
-        await update.message.reply_text(f"❌ Error: {e}")
 
 # ==============================================================================
 # 🚀 MAIN - WEBHOOK MODE
 # ==============================================================================
 
 async def post_init(app: Application):
-    logger.info("🔍 Initializing Terminator Bot (Webhook Mode)...")
-    logger.info(f"🤖 Token: {'✓' if BOT_TOKEN else '✗'}")
-    logger.info(f"🧠 Gemini: {'✓' if GEMINI_API_KEY else '✗'}")
-    logger.info(f"🗄 Supabase: {'✓' if SUPABASE_DB_URL else '✗'}")
-    logger.info(f"👤 Owner: {OWNER_ID}")
-    logger.info(f"🌐 Webhook Domain: {WEBHOOK_DOMAIN or 'NOT SET'}")
-    logger.info(f"🔗 Webhook Path: {WEBHOOK_PATH}")
-    logger.info(f"🚪 Port: {PORT}")
+    """Initialize bot"""
+    logger.info("🔍 Initializing TERMINATOR (AI-Powered + Supabase API)...")
+    logger.info(f"🤖 Bot Token: {'✓' if BOT_TOKEN else '✗'}")
+    logger.info(f"🧠 Gemini API: {'✓' if GEMINI_API_KEY else '✗'}")
+    logger.info(f"🗄 Supabase URL: {'✓' if SUPABASE_URL else '✗'}")
+    logger.info(f"🔑 Supabase Key: {'✓' if SUPABASE_KEY else '✗'}")
+    logger.info(f"👤 Owner ID: {OWNER_ID}")
+    logger.info(f"🌐 Webhook: {WEBHOOK_DOMAIN or 'NOT SET'}")
     
     if not BOT_TOKEN:
         logger.critical("❌ TERMINATOR_BOT_TOKEN missing")
         sys.exit(1)
-    if not SUPABASE_DB_URL:
-        logger.critical("❌ SUPABASE_DB_URL missing")
-        sys.exit(1)
     
-    await db.init()
-    asyncio.create_task(autonomous_loop())
+    db_connected = False
+    if SUPABASE_URL and SUPABASE_KEY:
+        db_connected = await db.init()
+        if db_connected:
+            logger.info(lang_mgr.get_template('db_init_success', 'en'))
+        else:
+            logger.warning(lang_mgr.get_template('db_init_failed', 'en'))
+    else:
+        logger.warning("⚠️ No Supabase credentials - running in limited mode")
     
-    # Set webhook on startup if domain is configured
-    if WEBHOOK_DOMAIN:
-        webhook_url = f"https://{WEBHOOK_DOMAIN}{WEBHOOK_PATH}"
-        try:
-            await app.bot.set_webhook(
-                url=webhook_url,
-                allowed_updates=Update.ALL_TYPES,
-                drop_pending_updates=True
-            )
-            logger.info(f"✅ Webhook registered: {webhook_url}")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not set webhook on startup: {e}")
-            logger.warning("💡 Use /setwebhook command after bot starts to retry")
+    asyncio.create_task(autonomous_loop(app))
     
-    logger.info("🤖 TERMINATOR SYSTEM ONLINE. Webhook mode active.")
+    logger.info("🤖 TERMINATOR SYSTEM ONLINE")
+    logger.info("🧠 AI Moderation: ACTIVE (Natural Language)")
+    logger.info("🔐 Permissions: Group Owners + Admins + Bot Owner")
+    logger.info("🌍 Multi-Language: Auto-detect")
 
 def main():
     try:
-        # Build application
         app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
         
-        # Register handlers
+        app.add_handler(CommandHandler("start", handle_start))
         app.add_handler(CommandHandler("sudostopterminator", cmd_killswitch))
-        app.add_handler(CommandHandler("setwebhook", cmd_setwebhook))  # Manual webhook setup
-        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-        app.add_handler(MessageHandler(filters.Regex(r"(?i)terminator"), handle_personality))
+        app.add_handler(CommandHandler("updatedcode", cmd_updatedcode))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_any_message))
+        app.add_handler(MessageHandler(filters.Regex(r"(?i)^terminator"), handle_any_message))
         app.add_handler(ChatMemberHandler(handle_join, ChatMemberHandler.CHAT_MEMBER))
+        app.add_handler(CallbackQueryHandler(lambda u, c: None))
         
-        # Run as webhook server
         logger.info(f"🚀 Starting webhook server on port {PORT}...")
         app.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            url_path=WEBHOOK_PATH.lstrip('/'),  # Remove leading slash for url_path
+            url_path=WEBHOOK_PATH.lstrip('/'),
             webhook_url=f"https://{WEBHOOK_DOMAIN}{WEBHOOK_PATH}" if WEBHOOK_DOMAIN else None,
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES
