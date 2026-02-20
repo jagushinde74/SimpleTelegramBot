@@ -1,6 +1,5 @@
-python-telegram-bot>=20.0
-google-generativeai>=0.8.0
-asyncpg
-python-dotenv
-langdetect
+python-telegram-bot[webhooks]>=22.0
+google-genai>=0.3.0
 supabase>=2.4.0
+langdetect>=1.0.9
+python-dotenv>=1.0.0
