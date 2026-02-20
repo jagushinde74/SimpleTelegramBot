@@ -75,25 +75,84 @@ if (GEMINI_API_KEY) {
 // 🧠 AI RESPONSE FUNCTION
 // ============================================================================
 
-async function generateAIResponse(text, role = "member") {
+async function generateAIResponse(userId, text, role = "member") {
   if (!model) return "System Offline: AI core not initialized.";
 
-  const prompt = `
+  let contents = [];
+  let history = [];
+  let botPersona = { tone: 'cold', aggression_level: 5, response_style: 'military', custom_phrases: [] };
+  let userInfo = { risk_score: 0, status: 'active' };
+
+  let sevenDaysAgo = new Date();
+  sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+
+  if (supabase) {
+    // 1. Concurrently fetch chat history, bot personality, and user info for maximum speed
+    const [memReq, personaReq, userReq] = await Promise.all([
+      supabase.from("chat_memory")
+        .select("role, content")
+        .eq("user_id", userId)
+        .gte("created_at", sevenDaysAgo.toISOString())
+        .order("created_at", { ascending: true }),
+      supabase.from("bot_personality").select("*").eq("id", 1).maybeSingle(),
+      supabase.from("users").select("*").eq("user_id", userId).maybeSingle()
+    ]);
+
+    if (memReq.data) history = memReq.data;
+    if (personaReq.data) botPersona = personaReq.data;
+    if (userReq.data) userInfo = userReq.data;
+
+    contents = history.map(msg => ({
+      role: msg.role, // 'user' or 'model'
+      parts: [{ text: msg.content }]
+    }));
+
+    // 2. Save the NEW user message to the database (fire & forget)
+    supabase.from("chat_memory").insert([{ user_id: userId, role: "user", content: text }]).catch(err => console.error("DB Error:", err.message));
+  }
+
+  // 3. Add the current message to the Gemini contents array
+  contents.push({ role: "user", parts: [{ text }] });
+
+  // 4. Dynamic System Prompt using database personality and user context
+  const systemPrompt = `
 You are TERMINATOR, a powerful AI Telegram moderator.
-User role: ${role}
+
+Current Persona Settings:
+- Tone: ${botPersona.tone}
+- Aggression Level: ${botPersona.aggression_level}/10
+- Style: ${botPersona.response_style}
+${botPersona.custom_phrases && botPersona.custom_phrases.length > 0 ? `- Custom Catchphrases to use occasionally: ${botPersona.custom_phrases.join(', ')}` : ''}
+
+User Context:
+- Role: ${role}
+- Risk Score: ${userInfo.risk_score} (Higher = more suspicious/dangerous)
+- Status: ${userInfo.status}
 
 Rules:
-- Reply in same language
-- If owner → respectful
-- Else → dominant
-
-Message:
-${text}
+- Reply in the same language as the user.
+- If user is owner → be respectful.
+- If user is member with high risk score → be extremely dominant and threatening.
+- If user is member with low risk score → be strict but standard.
 `;
 
   try {
-    const result = await model.generateContent(prompt);
-    return result.response.text();
+    const result = await model.generateContent({
+      systemInstruction: { parts: [{ text: systemPrompt }] },
+      contents: contents
+    });
+    
+    const replyText = result.response.text();
+
+    if (supabase) {
+      // 5. Save the Bot's reply to memory
+      supabase.from("chat_memory").insert([{ user_id: userId, role: "model", content: replyText }]).catch(() => {});
+      
+      // 6. Delete messages older than 7 days for this user to save database storage
+      supabase.from("chat_memory").delete().lt("created_at", sevenDaysAgo.toISOString()).eq("user_id", userId).catch(() => {});
+    }
+
+    return replyText;
   } catch (err) {
     console.error("AI error:", err);
     // Now prints the exact error into Telegram so we can debug it!
@@ -121,6 +180,7 @@ bot.on("text", (ctx) => {
   if (ctx.chat.type === "private") return; // Ignore DMs here, handled elsewhere if needed
 
   const userId = ctx.from.id;
+  const groupId = ctx.chat.id;
   const text = ctx.message.text;
   const role = userId === OWNER_ID ? "owner" : "member";
 
@@ -138,7 +198,23 @@ bot.on("text", (ctx) => {
   // FIX 2: Background the AI task so the Webhook replies to Telegram INSTANTLY
   // This prevents Telegram from timing out, delaying, and retrying!
   (async () => {
-    const reply = await generateAIResponse(text, role);
+    if (supabase) {
+      // Check Group AI Mode and Upsert Group if missing
+      const { data: groupData } = await supabase.from('groups').select('ai_mode').eq('group_id', groupId).maybeSingle();
+      if (groupData && groupData.ai_mode === 0) return; // Abort if AI is disabled in this group
+      if (!groupData) {
+        await supabase.from('groups').insert([{ group_id: groupId }]).catch(() => {});
+      }
+
+      // Upsert User (silently register them to track risk_score)
+      const { data: userData } = await supabase.from('users').select('user_id').eq('user_id', userId).maybeSingle();
+      if (!userData) {
+        await supabase.from('users').insert([{ user_id: userId, username: ctx.from.username || "Unknown" }]).catch(() => {});
+      }
+    }
+
+    // Pass the userId into the function so it can fetch their memory and context
+    const reply = await generateAIResponse(userId, text, role);
     
     if (reply) {
       await ctx.reply(reply, { 
@@ -146,10 +222,11 @@ bot.on("text", (ctx) => {
       }).catch(err => console.error("Reply sending error:", err.message));
 
       if (supabase) {
+        // Log the AI reply with the group ID included
         supabase.from("bot_logs").insert([
           {
             event_type: "ai_reply",
-            details: { user_id: userId, text }
+            details: { user_id: userId, group_id: groupId, text }
           }
         ]).catch(err => console.error("Supabase log error:", err.message));
       }
