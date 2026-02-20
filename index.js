@@ -55,6 +55,7 @@ let model = null;
 if (GEMINI_API_KEY) {
   try {
     const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+    // Using gemini-1.5-flash as requested
     model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
     console.log("✅ Gemini model ready");
   } catch (err) {
@@ -67,7 +68,7 @@ if (GEMINI_API_KEY) {
 // ============================================================================
 
 async function generateAIResponse(text, role = "member") {
-  if (!model) return null;
+  if (!model) return "System Offline: AI core not initialized.";
 
   const prompt = `
 You are TERMINATOR, a powerful AI Telegram moderator.
@@ -87,7 +88,7 @@ ${text}
     return result.response.text();
   } catch (err) {
     console.error("AI error:", err.message);
-    return null;
+    return "Error processing query. My neural net is temporarily disrupted.";
   }
 }
 
@@ -97,45 +98,52 @@ ${text}
 
 bot.start(async (ctx) => {
   if (ctx.chat.type !== "private") return;
-
-  await ctx.reply("Add me in your group with full admin rights then see MAGIC.");
+  await ctx.reply("Add me in your group with full admin rights, disable my group privacy in @BotFather, then see MAGIC.");
 });
 
 // ============================================================================
 // 💬 MESSAGE HANDLER
 // Now replies when:
 // 1. Message starts with "terminator"
-// 2. OR someone replies to bot message
+// 2. OR someone replies to THIS bot's message
 // ============================================================================
 
 bot.on("text", async (ctx) => {
-  console.log("📩 MESSAGE RECEIVED:", ctx.message.text);
-
-  if (ctx.chat.type === "private") return;
+  if (ctx.chat.type === "private") return; // Ignore DMs here, handled elsewhere if needed
 
   const userId = ctx.from.id;
   const text = ctx.message.text;
   const role = userId === OWNER_ID ? "owner" : "member";
 
-  const isReplyToBot = ctx.message.reply_to_message &&
-    ctx.message.reply_to_message.from &&
-    ctx.message.reply_to_message.from.is_bot;
+  // FIX: Check if the reply is specifically to THIS bot, not just any bot.
+  const botId = ctx.botInfo.id;
+  const isReplyToMe = ctx.message.reply_to_message?.from?.id === botId;
 
   const startsWithTrigger = text.toLowerCase().startsWith("terminator");
 
-  if (!startsWithTrigger && !isReplyToBot) return;
+  if (!startsWithTrigger && !isReplyToMe) return;
+
+  console.log(`📩 TRIGGER RECEIVED in group from ${userId}: ${text}`);
+
+  // Show "bot is typing..." action
+  await ctx.sendChatAction("typing");
 
   const reply = await generateAIResponse(text, role);
+  
   if (reply) {
-    await ctx.reply(reply);
+    // FIX: Properly quote the user's message when replying in the group
+    await ctx.reply(reply, { 
+      reply_parameters: { message_id: ctx.message.message_id } 
+    });
 
     if (supabase) {
-      await supabase.from("bot_logs").insert([
+      // Don't await the logging so the bot responds faster
+      supabase.from("bot_logs").insert([
         {
           event_type: "ai_reply",
           details: { user_id: userId, text }
         }
-      ]);
+      ]).catch(err => console.error("Supabase log error:", err.message));
     }
   }
 });
@@ -149,12 +157,14 @@ if (!RENDER_EXTERNAL_HOSTNAME) {
   process.exit(1);
 }
 
-const webhookUrl = `https://${RENDER_EXTERNAL_HOSTNAME}/`;
+// Using a slightly more secure path for the webhook callback
+const webhookPath = `/webhook`;
+const webhookUrl = `https://${RENDER_EXTERNAL_HOSTNAME}${webhookPath}`;
 
-app.use(bot.webhookCallback("/"));
+app.use(bot.webhookCallback(webhookPath));
 
 bot.telegram.setWebhook(webhookUrl)
-  .then(() => console.log("✅ Webhook set to", webhookUrl))
+  .then(() => console.log(`✅ Webhook securely set to ${webhookUrl}`))
   .catch(err => console.error("Webhook error:", err));
 
 app.listen(PORT, () => {
