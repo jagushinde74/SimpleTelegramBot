@@ -1,6 +1,5 @@
 // ============================================================================
-// 🤖 TERMINATOR - NODE.JS VERSION (WEBHOOK MODE - RENDER READY)
-// Stack: Node.js + Telegraf + Supabase + Gemini (google-genai)
+// 🤖 TERMINATOR - NODE.JS VERSION (WEBHOOK MODE - DEBUG + REPLY FIXED)
 // ============================================================================
 
 import express from "express";
@@ -20,6 +19,13 @@ const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const RENDER_EXTERNAL_HOSTNAME = process.env.RENDER_EXTERNAL_HOSTNAME;
 const PORT = process.env.PORT || 10000;
 
+console.log("🔍 ENV CHECK:");
+console.log("BOT_TOKEN:", BOT_TOKEN ? "OK" : "MISSING");
+console.log("GEMINI_API_KEY:", GEMINI_API_KEY ? "OK" : "MISSING");
+console.log("SUPABASE_URL:", SUPABASE_URL ? "OK" : "MISSING");
+console.log("SUPABASE_KEY:", SUPABASE_KEY ? "OK" : "MISSING");
+console.log("RENDER_EXTERNAL_HOSTNAME:", RENDER_EXTERNAL_HOSTNAME ? "OK" : "MISSING");
+
 if (!BOT_TOKEN) {
   console.error("❌ BOT TOKEN MISSING");
   process.exit(1);
@@ -33,14 +39,28 @@ const bot = new Telegraf(BOT_TOKEN);
 const app = express();
 app.use(express.json());
 
-// Supabase
-const supabase = SUPABASE_URL && SUPABASE_KEY
-  ? createClient(SUPABASE_URL, SUPABASE_KEY)
-  : null;
+// Supabase Init
+let supabase = null;
+if (SUPABASE_URL && SUPABASE_KEY) {
+  try {
+    supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+    console.log("✅ Supabase client created");
+  } catch (err) {
+    console.error("❌ Supabase init failed:", err.message);
+  }
+}
 
-// Gemini
-const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
-const model = genAI ? genAI.getGenerativeModel({ model: "gemini-1.5-flash" }) : null;
+// Gemini Init
+let model = null;
+if (GEMINI_API_KEY) {
+  try {
+    const genAI = new GoogleGenerativeAI(GEMINI_API_KEY);
+    model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+    console.log("✅ Gemini model ready");
+  } catch (err) {
+    console.error("❌ Gemini init failed:", err.message);
+  }
+}
 
 // ============================================================================
 // 🧠 AI RESPONSE FUNCTION
@@ -54,9 +74,9 @@ You are TERMINATOR, a powerful AI Telegram moderator.
 User role: ${role}
 
 Rules:
-- Reply in same language as message
-- If user is owner, speak respectfully
-- Otherwise speak dominant and sharp
+- Reply in same language
+- If owner → respectful
+- Else → dominant
 
 Message:
 ${text}
@@ -72,39 +92,38 @@ ${text}
 }
 
 // ============================================================================
-// 👤 START COMMAND (DM ONLY)
+// 👤 START (DM)
 // ============================================================================
 
 bot.start(async (ctx) => {
   if (ctx.chat.type !== "private") return;
 
-  const keyboard = {
-    inline_keyboard: [[
-      {
-        text: "➕ ADD TO GROUP",
-        url: `https://t.me/${ctx.botInfo.username}?startgroup=true`
-      }
-    ]]
-  };
-
-  await ctx.reply(
-    "Add me in your group with full admin rights then see MAGIC.",
-    { reply_markup: keyboard }
-  );
+  await ctx.reply("Add me in your group with full admin rights then see MAGIC.");
 });
 
 // ============================================================================
 // 💬 MESSAGE HANDLER
+// Now replies when:
+// 1. Message starts with "terminator"
+// 2. OR someone replies to bot message
 // ============================================================================
 
 bot.on("text", async (ctx) => {
+  console.log("📩 MESSAGE RECEIVED:", ctx.message.text);
+
   if (ctx.chat.type === "private") return;
 
   const userId = ctx.from.id;
   const text = ctx.message.text;
   const role = userId === OWNER_ID ? "owner" : "member";
 
-  if (!text.toLowerCase().startsWith("terminator")) return;
+  const isReplyToBot = ctx.message.reply_to_message &&
+    ctx.message.reply_to_message.from &&
+    ctx.message.reply_to_message.from.is_bot;
+
+  const startsWithTrigger = text.toLowerCase().startsWith("terminator");
+
+  if (!startsWithTrigger && !isReplyToBot) return;
 
   const reply = await generateAIResponse(text, role);
   if (reply) {
@@ -122,7 +141,7 @@ bot.on("text", async (ctx) => {
 });
 
 // ============================================================================
-// 🌐 WEBHOOK SETUP (RENDER)
+// 🌐 WEBHOOK SETUP
 // ============================================================================
 
 if (!RENDER_EXTERNAL_HOSTNAME) {
@@ -135,9 +154,9 @@ const webhookUrl = `https://${RENDER_EXTERNAL_HOSTNAME}/`;
 app.use(bot.webhookCallback("/"));
 
 bot.telegram.setWebhook(webhookUrl)
-  .then(() => console.log("✅ Webhook set"))
+  .then(() => console.log("✅ Webhook set to", webhookUrl))
   .catch(err => console.error("Webhook error:", err));
 
 app.listen(PORT, () => {
-  console.log(`🚀 TERMINATOR NODE BOT RUNNING ON PORT ${PORT}`);
+  console.log(`🚀 TERMINATOR RUNNING ON PORT ${PORT}`);
 });
