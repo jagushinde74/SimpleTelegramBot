@@ -3,3 +3,4 @@ google-generativeai>=0.8.0
 asyncpg
 python-dotenv
 langdetect
+supabase>=2.4.0
