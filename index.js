@@ -1,5 +1,5 @@
 // ============================================================================
-// 🤖 TERMINATOR - NODE.JS VERSION (WEBHOOK MODE - DEBUG + REPLY FIXED)
+// 🤖 TERMINATOR - NODE.JS VERSION (WEBHOOK MODE - DATABASE & MEMORY FIXED)
 // ============================================================================
 
 import express from "express";
@@ -102,17 +102,29 @@ async function generateAIResponse(userId, text, role = "member") {
     if (personaReq.data) botPersona = personaReq.data;
     if (userReq.data) userInfo = userReq.data;
 
-    contents = history.map(msg => ({
-      role: msg.role, // 'user' or 'model'
-      parts: [{ text: msg.content }]
-    }));
+    // FIX: Gemini crashes if roles don't alternate. We combine consecutive messages from the same role.
+    for (const msg of history) {
+      const last = contents[contents.length - 1];
+      if (last && last.role === msg.role) {
+        last.parts[0].text += `\n\n${msg.content}`;
+      } else {
+        contents.push({ role: msg.role, parts: [{ text: msg.content }] });
+      }
+    }
 
-    // 2. Save the NEW user message to the database (fire & forget)
-    supabase.from("chat_memory").insert([{ user_id: userId, role: "user", content: text }]).catch(err => console.error("DB Error:", err.message));
+    // 2. Save the NEW user message to the database (fire & forget, NO .catch() chaining)
+    supabase.from("chat_memory")
+      .insert([{ user_id: userId, role: "user", content: text }])
+      .then(({ error }) => { if (error) console.error("DB Error:", error.message) });
   }
 
-  // 3. Add the current message to the Gemini contents array
-  contents.push({ role: "user", parts: [{ text }] });
+  // 3. Add the current message to the Gemini contents array (checking for alternating roles)
+  const lastContent = contents[contents.length - 1];
+  if (lastContent && lastContent.role === "user") {
+    lastContent.parts[0].text += `\n\n${text}`;
+  } else {
+    contents.push({ role: "user", parts: [{ text }] });
+  }
 
   // 4. Dynamic System Prompt using database personality and user context
   const systemPrompt = `
@@ -146,16 +158,22 @@ Rules:
 
     if (supabase) {
       // 5. Save the Bot's reply to memory
-      supabase.from("chat_memory").insert([{ user_id: userId, role: "model", content: replyText }]).catch(() => {});
+      supabase.from("chat_memory")
+        .insert([{ user_id: userId, role: "model", content: replyText }])
+        .then(({ error }) => { if (error) console.error("Memory Save Error:", error.message) });
       
       // 6. Delete messages older than 7 days for this user to save database storage
-      supabase.from("chat_memory").delete().lt("created_at", sevenDaysAgo.toISOString()).eq("user_id", userId).catch(() => {});
+      supabase.from("chat_memory")
+        .delete()
+        .lt("created_at", sevenDaysAgo.toISOString())
+        .eq("user_id", userId)
+        .then(({ error }) => { if (error) console.error("Memory Cleanup Error:", error.message) });
     }
 
     return replyText;
   } catch (err) {
     console.error("AI error:", err);
-    // Now prints the exact error into Telegram so we can debug it!
+    // Prints the exact error into Telegram so we can debug it
     return `Error processing query. My neural net is temporarily disrupted.\n\n[DEBUG REASON]: ${err.message}`;
   }
 }
@@ -181,7 +199,9 @@ bot.on("text", (ctx) => {
 
   const userId = ctx.from.id;
   const groupId = ctx.chat.id;
-  const text = ctx.message.text;
+  const text = ctx.message.text || ctx.message.caption || "";
+  if (!text) return; // ignore non-text empty messages
+
   const role = userId === OWNER_ID ? "owner" : "member";
 
   const botId = ctx.botInfo.id;
@@ -192,24 +212,24 @@ bot.on("text", (ctx) => {
 
   console.log(`📩 TRIGGER RECEIVED in group from ${userId}: ${text}`);
 
-  // Show "bot is typing..." action (catch error if it fails)
+  // Show "bot is typing..." action (catch error if it fails like lacking permissions)
   ctx.sendChatAction("typing").catch(() => {});
 
-  // FIX 2: Background the AI task so the Webhook replies to Telegram INSTANTLY
-  // This prevents Telegram from timing out, delaying, and retrying!
+  // Background the AI task so the Webhook replies to Telegram INSTANTLY
   (async () => {
     if (supabase) {
       // Check Group AI Mode and Upsert Group if missing
       const { data: groupData } = await supabase.from('groups').select('ai_mode').eq('group_id', groupId).maybeSingle();
       if (groupData && groupData.ai_mode === 0) return; // Abort if AI is disabled in this group
       if (!groupData) {
-        await supabase.from('groups').insert([{ group_id: groupId }]).catch(() => {});
+        // No .catch() needed on awaited Supabase calls anymore
+        await supabase.from('groups').insert([{ group_id: groupId }]);
       }
 
       // Upsert User (silently register them to track risk_score)
       const { data: userData } = await supabase.from('users').select('user_id').eq('user_id', userId).maybeSingle();
       if (!userData) {
-        await supabase.from('users').insert([{ user_id: userId, username: ctx.from.username || "Unknown" }]).catch(() => {});
+        await supabase.from('users').insert([{ user_id: userId, username: ctx.from.username || "Unknown" }]);
       }
     }
 
@@ -217,18 +237,16 @@ bot.on("text", (ctx) => {
     const reply = await generateAIResponse(userId, text, role);
     
     if (reply) {
+      // Reply to the user specifically
       await ctx.reply(reply, { 
         reply_parameters: { message_id: ctx.message.message_id } 
       }).catch(err => console.error("Reply sending error:", err.message));
 
       if (supabase) {
         // Log the AI reply with the group ID included
-        supabase.from("bot_logs").insert([
-          {
-            event_type: "ai_reply",
-            details: { user_id: userId, group_id: groupId, text }
-          }
-        ]).catch(err => console.error("Supabase log error:", err.message));
+        supabase.from("bot_logs")
+          .insert([{ event_type: "ai_reply", details: { user_id: userId, group_id: groupId, text } }])
+          .then(({ error }) => { if (error) console.error("Supabase log error:", error.message) });
       }
     }
   })();
